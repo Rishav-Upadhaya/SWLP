@@ -12,6 +12,7 @@ Supported families:
 """
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -266,10 +267,22 @@ def _build_causal_mask(
 
     use_sliding = getattr(config, "sliding_window", None) is not None
     mask_fn = create_sliding_window_causal_mask if use_sliding else create_causal_mask
+
+    # The parameter name changed across transformers versions:
+    #   ≤ 5.x:  inputs_embeds  (plural)
+    #   newer:  input_embeds   (singular)
+    # Detect the correct name from the function signature to be forward- and
+    # backward-compatible without hard-coding either variant.
+    sig_params = inspect.signature(mask_fn).parameters
+    if "inputs_embeds" in sig_params:
+        embeds_kwarg = "inputs_embeds"
+    else:
+        embeds_kwarg = "input_embeds"
+
     try:
         return mask_fn(
             config=config,
-            inputs_embeds=inputs_embeds,
+            **{embeds_kwarg: inputs_embeds},
             attention_mask=attention_mask,
             past_key_values=past_state,
             position_ids=position_ids,

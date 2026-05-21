@@ -56,23 +56,100 @@ AirLLM also cannot run Mistral-Small-24B (architecture incompatibility); SWLP ru
 
 ---
 
+## Platform Support
+
+> ⚠️ **Testing status**
+
+| Platform | Hardware | Status | Notes |
+|----------|----------|--------|-------|
+| macOS (Apple Silicon) | M1 / M2 / M3 / M5 | ✅ **Fully tested** | All backends validated — SWLP streaming, MLX int8/int4, speculative decoding |
+| Linux (NVIDIA GPU) | MX230, RTX series | 🔧 **Implemented, not yet benchmarked** | CUDA async-PCIe streaming path is built; end-to-end numbers pending |
+| Linux (CPU only) | Any | 🧪 **Partial** | SWLP streaming runs on CPU; MLX backend unavailable |
+| Windows | Any | ❌ **Untested** | No known blockers but not validated |
+
+The library was developed and benchmarked on **macOS with Apple M5 (16 GB unified memory)**. If you run it on Linux/NVIDIA and collect numbers, please open a PR — the CUDA path is ready and waiting for measurements.
+
+---
+
 ## Installation
 
-**Requirements:** Python ≥ 3.11, macOS (Apple Silicon) or Linux (NVIDIA)
+**Requirements:** Python ≥ 3.11
+
+### Option 1 — uv (recommended, fastest)
+
+[`uv`](https://docs.astral.sh/uv/) is a fast Python package manager. It handles virtual environments and dependencies in one step.
+
+```bash
+# Install uv if you don't have it
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Clone and set up
+git clone https://github.com/rishavupadhaya/swlp.git
+cd swlp
+
+# Create venv + install all core + dev dependencies in one shot
+uv sync --extra dev
+
+# Activate
+source .venv/bin/activate
+```
+
+**Apple Silicon — add the MLX backend:**
+```bash
+uv sync --extra dev --extra apple
+```
+
+**NVIDIA GPU — add VRAM tracking:**
+```bash
+uv sync --extra dev --extra gpu
+```
+
+---
+
+### Option 2 — pip (standard)
 
 ```bash
 git clone https://github.com/rishavupadhaya/swlp.git
 cd swlp
 
-bash scripts/bootstrap.sh    # creates .venv and installs swlp[dev]
-source .venv/bin/activate
+# Create and activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate          # macOS / Linux
+# .venv\Scripts\activate           # Windows
+
+# Install SWLP with dev tools
+pip install -e ".[dev]"
 ```
 
-**Optional extras:**
+**Apple Silicon — add the MLX backend:**
+```bash
+pip install -e ".[dev,apple]"
+```
+
+**NVIDIA GPU — add VRAM tracking:**
+```bash
+pip install -e ".[dev,gpu]"
+```
+
+**Or install from requirements.txt:**
+```bash
+pip install -r requirements.txt
+# Then uncomment mlx / pynvml lines in requirements.txt if needed
+```
+
+---
+
+### Verify the installation
 
 ```bash
-pip install swlp[apple]      # MLX backend — Apple Silicon native compute
-pip install swlp[gpu]        # NVIDIA VRAM tracking (pynvml)
+# Should print help with no errors
+swlp --help
+
+# Smoke test — no model or GPU needed
+swlp --backend mock --prompt "Hello, does SWLP work?"
+
+# Check your hardware (SSD bandwidth, MPS/CUDA availability)
+python scripts/phase0_hardware_check.py
 ```
 
 ---
@@ -378,7 +455,6 @@ Any HuggingFace Llama / Mistral family model works with the SWLP streaming backe
 | [`docs/hardware_baseline.md`](docs/hardware_baseline.md) | M5 measured SSD/MPS/RAM numbers |
 | [`docs/phase5_design_decisions.md`](docs/phase5_design_decisions.md) | Speculative decoding design rationale |
 | [`docs/model_packaging.md`](docs/model_packaging.md) | SWLP package format spec |
-| [`.claude/CLAUDE.md`](.claude/CLAUDE.md) | Full architecture + 18-phase build history |
 
 ---
 
