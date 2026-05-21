@@ -1,0 +1,16 @@
+[scenario]
+name = "baseline-dev"
+num_layers = 12
+layer_compute_ms = 8.0
+layer_weight_mb = 50.0
+window_sizes = [2, 4, 8]
+context_tokens = 512
+generate_tokens = 64
+kv_bytes_per_token = 2048
+vram_capacity_mb = 8000
+ram_capacity_mb = 32000
+pcie_bandwidth_gbps = 12.0
+ram_bandwidth_gbps = 40.0
+disk_bandwidth_gbps = 1.5
+disk_staging = false
+overlap = true

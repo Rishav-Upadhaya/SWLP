@@ -1,0 +1,42 @@
+# SWLP config for Apple Silicon (M-series) — MPS device, threading-based scheduler
+# Use this on MacBook M1/M2/M3/M4/M5 with unified memory.
+# SSD→RAM is your bottleneck (~6.5 GB/s), not PCIe. Window size 4-6 hides latency.
+
+[model]
+model_id = "sshleifer/tiny-gpt2"
+local_model_path = ""
+trust_remote_code = false
+revision = ""
+
+[cache]
+cache_dir = ".cache/hf"
+offline = false
+
+[generation]
+max_new_tokens = 64
+temperature = 0.0
+top_p = 1.0
+do_sample = false
+repetition_penalty = 1.0
+seed = 42
+prompt = "Summarize the benefits of a local LLM runtime in two sentences."
+
+[runtime]
+device = "mps"
+dtype = "auto"
+backend = "swlp"
+allow_mock_fallback = false
+log_level = "INFO"
+json_logs = true
+profile = true
+# Larger window on M5: SSD is 6.5 GB/s, compute is fast — need more overlap
+swlp_window_size = 4
+swlp_prefetch_depth = 2
+swlp_prefetch = true
+swlp_double_buffer = false   # not applicable on MPS; ThreadedScheduler ignores this
+swlp_pin_memory = false      # pin_memory is CUDA-specific; ThreadedScheduler ignores this
+swlp_fallback_to_baseline = true
+kv_memory_budget_mb = 2048
+kv_compression = true
+kv_compression_level = 6
+kv_tiering = true

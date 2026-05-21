@@ -1,0 +1,16 @@
+[suite]
+name = "local-baseline"
+prompts = [
+  "Explain the benefits of streaming layers in a local LLM runtime.",
+  "Summarize the following note in two sentences: SWLP overlaps transfer and compute.",
+  "Write a short checklist for validating a new runtime feature.",
+]
+context_lengths = [64, 256, 512]
+runs_per_case = 1
+window_sizes = [1, 2, 4]
+prefetch_depths = [1, 2, 4]
+prefetch_enabled = [true, false]
+double_buffer_enabled = [true, false]
+kv_memory_budget_mb = [256, 512, 1024]
+kv_compression = [false, true]
+kv_tiering = [false, true]

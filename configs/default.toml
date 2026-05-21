@@ -1,0 +1,37 @@
+[model]
+model_id = "sshleifer/tiny-gpt2"
+local_model_path = ""
+trust_remote_code = false
+revision = ""
+
+[cache]
+cache_dir = ".cache/hf"
+offline = false
+
+[generation]
+max_new_tokens = 32
+temperature = 0.0
+top_p = 1.0
+do_sample = false
+repetition_penalty = 1.0
+seed = 42
+prompt = "Write a short, friendly welcome message for a local LLM runtime."
+
+[runtime]
+device = "auto"
+dtype = "auto"
+backend = "hf"
+allow_mock_fallback = true
+log_level = "WARNING"
+json_logs = false
+profile = false
+swlp_window_size = 2
+swlp_prefetch_depth = 2
+swlp_prefetch = true
+swlp_double_buffer = true
+swlp_pin_memory = true
+swlp_fallback_to_baseline = true
+kv_memory_budget_mb = 512
+kv_compression = false
+kv_compression_level = 0
+kv_tiering = false

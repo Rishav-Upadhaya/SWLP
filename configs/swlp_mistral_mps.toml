@@ -1,0 +1,43 @@
+# SWLP config for Mistral-7B on M5 (Apple Silicon, MPS).
+# Streams per-layer weights from ./shards/mistral-7b via StreamingScheduler.
+# Phase 1 target: prove SSD→RAM streaming works end-to-end at 7B scale.
+
+[model]
+model_id = "unsloth/mistral-7b-instruct-v0.2"
+local_model_path = ""
+trust_remote_code = false
+revision = ""
+
+[cache]
+cache_dir = ".cache/hf"
+offline = false
+
+[generation]
+max_new_tokens = 32
+temperature = 0.0
+top_p = 1.0
+do_sample = false
+repetition_penalty = 1.0
+seed = 42
+prompt = "Explain in one sentence what makes a Macbook Air good for development."
+
+[runtime]
+device = "mps"
+dtype = "float16"
+backend = "swlp"
+allow_mock_fallback = false
+log_level = "INFO"
+json_logs = false
+profile = true
+swlp_window_size = 4
+swlp_prefetch_depth = 2
+swlp_prefetch = true
+swlp_double_buffer = false
+swlp_pin_memory = false
+swlp_fallback_to_baseline = false
+kv_memory_budget_mb = 4096
+kv_compression = false
+kv_compression_level = 0
+kv_tiering = false
+shard_dir = "./shards/mistral-7b"
+swlp_residency = "auto"

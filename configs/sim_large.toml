@@ -1,0 +1,16 @@
+[scenario]
+name = "large-model-target"
+num_layers = 32
+layer_compute_ms = 4.5
+layer_weight_mb = 120.0
+window_sizes = [4, 8, 16]
+context_tokens = 1024
+generate_tokens = 128
+kv_bytes_per_token = 4096
+vram_capacity_mb = 12000
+ram_capacity_mb = 64000
+pcie_bandwidth_gbps = 14.0
+ram_bandwidth_gbps = 55.0
+disk_bandwidth_gbps = 2.0
+disk_staging = true
+overlap = true

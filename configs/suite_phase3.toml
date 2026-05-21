@@ -1,0 +1,21 @@
+# Phase 3 suite — minimal baseline-vs-SWLP window sweep.
+# The suite ALWAYS runs an HF full-model baseline per prompt before the SWLP
+# cases. A 7B FP16 model (~14 GB) does not fit a 16 GB M5 — the HF baseline
+# hard-OOMs and aborts the whole process — so this suite is paired with a
+# full-loadable model (`--config configs/baseline.toml`, tiny-gpt2) to produce
+# the structured SuiteResult JSON artifact. The Mistral-7B window sweep is
+# measured directly instead; see docs/results.md.
+[suite]
+name = "phase3-mistral"
+prompts = [
+  "Explain in one sentence what makes a Macbook Air good for development.",
+]
+context_lengths = [64]
+runs_per_case = 1
+window_sizes = [2, 4, 6]
+prefetch_depths = [2]
+prefetch_enabled = [true]
+double_buffer_enabled = [false]
+kv_memory_budget_mb = [4096]
+kv_compression = [false]
+kv_tiering = [false]

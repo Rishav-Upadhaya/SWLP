@@ -1,0 +1,21 @@
+# Simulator scenario for Apple M5 16 GB — values from phase0_hardware_check.py
+# SSD read: 6.93 GB/s  | MPS matmul 1k×1k: 4.2 ms
+# Targeting Mistral-7B FP16: ~175 MB/layer, 32 layers
+# Window W=4 means 4 layers in RAM at once (~700 MB footprint)
+
+[scenario]
+name = "m5-mistral-7b"
+num_layers = 32
+layer_compute_ms = 20.0        # estimated MPS per-layer forward at 7B scale
+layer_weight_mb = 175.0        # ~7B FP16 / 32 layers
+window_sizes = [2, 4, 6]
+context_tokens = 512
+generate_tokens = 64
+kv_bytes_per_token = 4096      # 7B, FP16 KV per token
+vram_capacity_mb = 16384       # M5 unified RAM (16 GB)
+ram_capacity_mb = 16384        # same pool — unified memory
+pcie_bandwidth_gbps = 153.0    # unified memory: no PCIe hop; model at RAM bandwidth so disk→RAM dominates
+ram_bandwidth_gbps = 153.0     # M5 LPDDR5X unified memory bandwidth
+disk_bandwidth_gbps = 6.93     # measured SSD read speed (phase0_hardware_check.py)
+disk_staging = true            # layers stream from SSD → unified RAM
+overlap = true

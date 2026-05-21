@@ -1,0 +1,34 @@
+# Phase 8 — MLX native quantized inference on M5 (Apple Silicon).
+# MlxRunner runs native quantized matmul via mlx-lm — the interactive-speed
+# counterpart to the lossless SWLP streaming runners. Requires the apple extra:
+#   pip install swlp[apple]
+# Quality dial: mlx_quant = "bf16" (lossless) | "int8" (near-lossless) | "int4" (fast).
+
+[model]
+model_id = "unsloth/mistral-7b-instruct-v0.2"
+local_model_path = ""
+trust_remote_code = false
+revision = ""
+
+[cache]
+cache_dir = ".cache/hf"
+offline = false
+
+[generation]
+max_new_tokens = 32
+temperature = 0.0
+top_p = 1.0
+do_sample = false
+repetition_penalty = 1.0
+seed = 42
+prompt = "Explain in one sentence what makes a Macbook Air good for development."
+
+[runtime]
+device = "mps"
+dtype = "float16"
+backend = "mlx"
+allow_mock_fallback = false
+log_level = "INFO"
+json_logs = false
+profile = true
+mlx_quant = "int8"
