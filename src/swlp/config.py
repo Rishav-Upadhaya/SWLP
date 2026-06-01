@@ -102,6 +102,9 @@ class RuntimeConfig:
     # MLX backend (Phase 8): native quantized compute on Apple Silicon.
     # "bf16" (lossless) | "int8" (near-lossless, default) | "int4" (fast tier)
     mlx_quant: str = "int8"
+    # Optional draft model for MLX speculative decoding (alias or HF id).
+    # Must share the same tokenizer as the main model. Empty = disabled.
+    mlx_draft_model: str = ""
     # Phase 18: INT4 KV quantization — off by default (lossy).
     # "none" = lossless (default) | "int4" = ~4× smaller KV, ~0.5–1% ppl cost.
     # Must be explicitly opt-in; always labelled in reports.
@@ -245,6 +248,7 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
         os.getenv("SWLP_SPEC_MAX_DRAFT"), int(runtime.get("swlp_spec_max_draft", 8))
     )
     mlx_quant = os.getenv("SWLP_MLX_QUANT", runtime.get("mlx_quant", "int8"))
+    mlx_draft_model = os.getenv("SWLP_MLX_DRAFT_MODEL", runtime.get("mlx_draft_model", ""))
     kv_window = _parse_int(os.getenv("SWLP_KV_WINDOW"), int(runtime.get("kv_window", 0)))
     kv_quant = os.getenv("SWLP_KV_QUANT", runtime.get("kv_quant", "none"))
 
@@ -291,6 +295,7 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
             swlp_spec_ngram=swlp_spec_ngram,
             swlp_spec_max_draft=swlp_spec_max_draft,
             mlx_quant=str(mlx_quant),
+            mlx_draft_model=str(mlx_draft_model),
             kv_quant=str(kv_quant),
         ),
     )

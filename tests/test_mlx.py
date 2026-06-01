@@ -1,8 +1,9 @@
-"""Tests for swlp.runner.mlx — MlxRunner config and wiring (Phase 8).
+"""Tests for swlp.runner.mlx — MlxRunner config and wiring.
 
-These cover construction, the quality-dial validation, model-path resolution
-and build_runner registration. The actual MLX forward pass is not exercised
-here — it needs a real model and is measured separately.
+These cover construction, quality-dial validation, model-path resolution,
+build_runner registration, and the new M5 optimisation knobs (draft model,
+max_kv_size / kv_bits generation kwargs).  The actual MLX forward pass is not
+exercised here — it needs a real model and is measured separately.
 """
 from __future__ import annotations
 
@@ -19,6 +20,9 @@ def _mlx_config(quant: str = "int8") -> AppConfig:
     config.runtime.mlx_quant = quant
     config.model.model_id = "unsloth/mistral-7b-instruct-v0.2"
     return config
+
+
+# ── basic construction ────────────────────────────────────────────────────────
 
 
 def test_build_runner_returns_mlx_runner():
@@ -60,3 +64,70 @@ def test_tokenizer_starts_as_none():
     runner = MlxRunner(_mlx_config())
     assert runner.tokenizer is None
     assert runner._mlx_model is None
+
+
+# ── draft model wiring ────────────────────────────────────────────────────────
+
+
+def test_draft_model_default_is_empty():
+    config = _mlx_config()
+    assert config.runtime.mlx_draft_model == ""
+
+
+def test_draft_model_stored_on_runner():
+    """Draft model field is accessible; runner starts with no loaded draft."""
+    runner = MlxRunner(_mlx_config())
+    assert runner._mlx_draft_model is None
+
+
+def test_draft_model_set_via_config():
+    config = _mlx_config()
+    config.runtime.mlx_draft_model = "HuggingFaceTB/SmolLM2-360M-Instruct"
+    runner = MlxRunner(config)
+    assert runner.config.runtime.mlx_draft_model == "HuggingFaceTB/SmolLM2-360M-Instruct"
+
+
+# ── _gen_kwargs (max_kv_size / kv_bits) ──────────────────────────────────────
+
+
+def test_gen_kwargs_empty_by_default():
+    runner = MlxRunner(_mlx_config())
+    assert runner._gen_kwargs() == {}
+
+
+def test_gen_kwargs_max_kv_size_from_kv_window():
+    config = _mlx_config()
+    config.runtime.kv_window = 512
+    runner = MlxRunner(config)
+    assert runner._gen_kwargs()["max_kv_size"] == 512
+
+
+def test_gen_kwargs_no_max_kv_size_when_kv_window_zero():
+    config = _mlx_config()
+    config.runtime.kv_window = 0
+    runner = MlxRunner(config)
+    assert "max_kv_size" not in runner._gen_kwargs()
+
+
+def test_gen_kwargs_kv_bits_when_int4():
+    config = _mlx_config()
+    config.runtime.kv_quant = "int4"
+    runner = MlxRunner(config)
+    assert runner._gen_kwargs()["kv_bits"] == 4
+
+
+def test_gen_kwargs_no_kv_bits_when_none():
+    config = _mlx_config()
+    config.runtime.kv_quant = "none"
+    runner = MlxRunner(config)
+    assert "kv_bits" not in runner._gen_kwargs()
+
+
+def test_gen_kwargs_combined():
+    config = _mlx_config()
+    config.runtime.kv_window = 256
+    config.runtime.kv_quant = "int4"
+    runner = MlxRunner(config)
+    kwargs = runner._gen_kwargs()
+    assert kwargs["max_kv_size"] == 256
+    assert kwargs["kv_bits"] == 4

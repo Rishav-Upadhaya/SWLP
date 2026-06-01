@@ -1,6 +1,8 @@
-"""Tests for swlp.core.streaming — StreamingScheduler overlap tracking and pin_memory."""
+"""Tests for swlp.core.streaming — StreamingScheduler overlap tracking, pin_memory,
+and the F_NOCACHE direct-I/O helpers."""
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
 
@@ -8,6 +10,7 @@ import torch
 import torch.nn as nn
 
 from swlp.core.scheduler import SchedulerConfig
+from swlp.core.streaming import _read_file_nocache, _safetensors_metadata
 from swlp.core.streaming import StreamingScheduler
 
 
@@ -124,3 +127,99 @@ def test_multiple_ensures_accumulate_stats(tmp_path: Path) -> None:
     assert stats["misses"] == 4
     assert stats["total"] == 4
     assert stats["hit_rate"] == 0.0
+
+
+# ── _read_file_nocache ────────────────────────────────────────────────────────
+
+
+def test_read_file_nocache_returns_correct_bytes(tmp_path: Path) -> None:
+    """_read_file_nocache reads back the exact bytes written to a file."""
+    payload = b"swlp-test-" * 1000
+    f = tmp_path / "test.bin"
+    f.write_bytes(payload)
+    result = _read_file_nocache(f)
+    assert result == payload
+
+
+def test_read_file_nocache_large_file(tmp_path: Path) -> None:
+    """Reads files larger than the 4 MB chunk size correctly."""
+    payload = b"x" * (6 * 1024 * 1024)  # 6 MB > 4 MB chunk
+    f = tmp_path / "large.bin"
+    f.write_bytes(payload)
+    result = _read_file_nocache(f)
+    assert len(result) == len(payload)
+    assert result == payload
+
+
+def test_read_file_nocache_empty_file(tmp_path: Path) -> None:
+    f = tmp_path / "empty.bin"
+    f.write_bytes(b"")
+    assert _read_file_nocache(f) == b""
+
+
+# ── _safetensors_metadata ─────────────────────────────────────────────────────
+
+
+def test_safetensors_metadata_extracts_custom_key(tmp_path: Path) -> None:
+    """Metadata written to a .safetensors file is readable via the binary header."""
+    from safetensors.torch import save_file as st_save_file
+
+    tensors = {"w": torch.zeros(4, 4)}
+    path = tmp_path / "layer_000.safetensors"
+    st_save_file(tensors, str(path), metadata={"__swlp_quant__": "float8", "version": "1"})
+
+    data = _read_file_nocache(path)
+    meta = _safetensors_metadata(data)
+    assert meta["__swlp_quant__"] == "float8"
+    assert meta["version"] == "1"
+
+
+def test_safetensors_metadata_missing_returns_empty(tmp_path: Path) -> None:
+    from safetensors.torch import save_file as st_save_file
+
+    tensors = {"w": torch.zeros(2)}
+    path = tmp_path / "layer_000.safetensors"
+    st_save_file(tensors, str(path))  # no metadata
+    data = _read_file_nocache(path)
+    assert _safetensors_metadata(data) == {}
+
+
+def test_safetensors_metadata_truncated_data() -> None:
+    assert _safetensors_metadata(b"") == {}
+    assert _safetensors_metadata(b"\x00" * 4) == {}
+
+
+# ── nocache path used by StreamingScheduler (.safetensors shards) ─────────────
+
+
+def _write_safetensors_shards(
+    shard_dir: Path, num_layers: int = 3, hidden: int = 4
+) -> list[nn.Module]:
+    from safetensors.torch import save_file as st_save_file
+
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    blocks: list[nn.Module] = []
+    for i in range(num_layers):
+        state = {"weight": torch.zeros(hidden, hidden), "bias": torch.zeros(hidden)}
+        st_save_file(state, str(shard_dir / f"layer_{i:03d}.safetensors"))
+        with torch.device("meta"):
+            block = nn.Linear(hidden, hidden)
+        blocks.append(block)
+    return blocks
+
+
+def test_scheduler_loads_safetensors_via_nocache(tmp_path: Path) -> None:
+    """StreamingScheduler loads .safetensors shards correctly via the new I/O path."""
+    from swlp.core.streaming import StreamingScheduler
+
+    shard_dir = tmp_path / "shards"
+    blocks = _write_safetensors_shards(shard_dir, num_layers=3)
+    cfg = _make_config(prefetch=False)
+    scheduler = StreamingScheduler(blocks, torch.device("cpu"), cfg, shard_dir)
+
+    for i in range(3):
+        block = scheduler.ensure(i)
+        assert block is not None
+        # Verify the block is materialised on CPU (not meta device).
+        for p in block.parameters():
+            assert p.device.type == "cpu"

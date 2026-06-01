@@ -29,7 +29,11 @@ resident layers instead of the slow SSD→CPU read.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+import struct
+import sys
 import threading
 from collections.abc import Iterable
 from pathlib import Path
@@ -41,6 +45,47 @@ from ..model.sparse import decode_sparse
 from .scheduler import PrefetchError, SchedulerConfig
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _read_file_nocache(path: Path) -> bytes:
+    """Read a file bypassing the OS page cache on macOS (F_NOCACHE).
+
+    Prevents large model-shard reads from evicting other data from the unified
+    memory page cache.  Falls back to a normal read on non-macOS platforms.
+    Uses 4 MB sequential chunks for optimal SSD throughput.
+    """
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        if sys.platform == "darwin":
+            import fcntl
+            # F_NOCACHE disables UBC (Unified Buffer Cache) for this fd.
+            fcntl.fcntl(fd, getattr(fcntl, "F_NOCACHE", 48), 1)
+        size = os.fstat(fd).st_size
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 4 * 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _safetensors_metadata(data: bytes) -> dict[str, str]:
+    """Parse the ``__metadata__`` dict from a safetensors file's binary header."""
+    if len(data) < 8:
+        return {}
+    header_len = struct.unpack_from("<Q", data, 0)[0]
+    if len(data) < 8 + header_len:
+        return {}
+    try:
+        header = json.loads(data[8 : 8 + header_len])
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return header.get("__metadata__", {}) or {}
 
 
 def has_shards(shard_dir: str | Path) -> bool:
@@ -55,15 +100,15 @@ def _load_safetensors_shard(path: Path) -> dict:
     FP8 shards (metadata ``__swlp_quant__ = float8``) return the nested
     ``{"__swlp_quant__": "float8", "weights": {name: {"data": ..., "scale": ...}}}``
     format expected by ``dequantize_layer_state()``.
-    """
-    from safetensors import safe_open
 
-    flat: dict[str, torch.Tensor] = {}
-    metadata: dict[str, str] = {}
-    with safe_open(str(path), framework="pt", device="cpu") as handle:
-        metadata = handle.metadata() or {}
-        for k in handle.keys():
-            flat[k] = handle.get_tensor(k)
+    Uses direct I/O (F_NOCACHE on macOS) to prevent shard reads from polluting
+    the OS page cache with model weights that are only needed once per token.
+    """
+    from safetensors.torch import load as _st_load
+
+    data = _read_file_nocache(path)
+    metadata = _safetensors_metadata(data)
+    flat: dict[str, torch.Tensor] = _st_load(data)
 
     quant_scheme = metadata.get("__swlp_quant__", "")
     if quant_scheme == "float8":
@@ -159,7 +204,9 @@ class StreamingScheduler:
             if path.suffix == ".safetensors":
                 state = _load_safetensors_shard(path)
             else:
-                state = torch.load(str(path), map_location="cpu", weights_only=True)
+                import io
+                data = _read_file_nocache(path)
+                state = torch.load(io.BytesIO(data), map_location="cpu", weights_only=True)
             # Pin CPU memory for faster CPU→CUDA DMA transfers (no-op on unified
             # memory / MPS). Wrapped in try/except — pin_memory() can raise on
             # platforms that do not support it.

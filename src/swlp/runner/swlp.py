@@ -468,6 +468,12 @@ class SWLPRunner(HuggingFaceRunner):
         and ``ctx.past_state`` is the KV cache populated by the prefill sweep.
         """
         assert self.model is not None
+        cb: Callable[[str], None] | None = getattr(self, "_token_callback", None)
+        # Use incremental decoding so SentencePiece space-prefixed tokens (▁word →
+        # " word") are preserved.  Decoding a single token ID in isolation strips the
+        # leading space; decoding the full sequence and diffing against the previous
+        # length produces the correct text including any whitespace.
+        _prev_text: str = getattr(self, "_stream_prev_text", "")
         for _ in range(max(self.config.generation.max_new_tokens - 1, 0)):
             position_offset = int(generated.shape[-1] - 1)
             ctx = adapter.prepare_step(
@@ -482,14 +488,12 @@ class SWLPRunner(HuggingFaceRunner):
             logits = self.model.lm_head(hidden_states)[:, -1, :]
             next_token = self._select_next(logits, generated)
             generated = torch.cat([generated, next_token], dim=-1)
-            # Optional streaming callback — called with each decoded token text.
-            cb: Callable[[str], None] | None = getattr(self, "_token_callback", None)
             if cb is not None and self.tokenizer is not None:
-                token_text = self.tokenizer.decode(
-                    [int(next_token.item())], skip_special_tokens=True
-                )
-                if token_text:
-                    cb(token_text)
+                _new_text = self.tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
+                _delta = _new_text[len(_prev_text):]
+                if _delta:
+                    cb(_delta)
+                _prev_text = _new_text
             if self.tokenizer is not None and self.tokenizer.eos_token_id is not None:
                 if int(next_token.item()) == int(self.tokenizer.eos_token_id):
                     break
@@ -615,6 +619,27 @@ class SWLPRunner(HuggingFaceRunner):
                     next_token = self._select_next(logits, input_ids)
                     first_token_end = time.perf_counter()
                     generated = torch.cat([input_ids, next_token], dim=-1)
+                    # Emit first generated token via streaming callback.
+                    # Must happen before _generate_remaining so token #1 is not
+                    # silently dropped from the stream.  Also initialise
+                    # _stream_prev_text so _generate_remaining's incremental
+                    # decoder starts from the right baseline.
+                    _stream_cb: Callable[[str], None] | None = getattr(
+                        self, "_token_callback", None
+                    )
+                    if _stream_cb is not None and self.tokenizer is not None:
+                        _baseline = self.tokenizer.decode(
+                            input_ids[0].tolist(), skip_special_tokens=True
+                        )
+                        _after_first = self.tokenizer.decode(
+                            generated[0].tolist(), skip_special_tokens=True
+                        )
+                        _first_delta = _after_first[len(_baseline):]
+                        if _first_delta:
+                            _stream_cb(_first_delta)
+                        self._stream_prev_text: str = _after_first
+                    else:
+                        self._stream_prev_text = ""
                     generated = self._generate_remaining(adapter, scheduler, ctx, generated)
 
             completion_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)

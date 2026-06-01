@@ -17,13 +17,41 @@ Usage (standalone, model already sharded):
 """
 from __future__ import annotations
 
+import io
 import logging
+import os
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _read_file_nocache(path: Path) -> bytes:
+    """Read a file bypassing the OS page cache on macOS (F_NOCACHE).
+
+    Prevents shard reads from evicting other data from the unified memory page
+    cache.  Falls back to a normal read on non-macOS platforms.
+    """
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        if sys.platform == "darwin":
+            import fcntl
+            fcntl.fcntl(fd, getattr(fcntl, "F_NOCACHE", 48), 1)
+        size = os.fstat(fd).st_size
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 4 * 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 @dataclass
@@ -57,7 +85,8 @@ class ThreadedPipeline:
         if not path.exists():
             LOGGER.warning("shard_missing", extra={"layer": idx, "path": str(path)})
             return
-        weights = torch.load(str(path), map_location="cpu", weights_only=True)
+        data = _read_file_nocache(path)
+        weights = torch.load(io.BytesIO(data), map_location="cpu", weights_only=True)
         with self._lock:
             self._window[idx] = weights
         LOGGER.debug("pipeline_loaded", extra={"layer": idx})

@@ -42,8 +42,7 @@ def test_help_command_prints_all_sections(capsys):
     exit_code = main(["help"])
     captured = capsys.readouterr()
     assert exit_code == 0
-    # Simplified help has four sections.
-    for section in ("QUICK START", "DOWNLOAD", "CHAT", "KEY FLAGS"):
+    for section in ("QUICK START", "DOWNLOAD", "CHAT", "FLAGS", "BENCHMARKING"):
         assert section in captured.out, f"Missing section: {section}"
     # Key commands must appear.
     assert "swlp download --model" in captured.out

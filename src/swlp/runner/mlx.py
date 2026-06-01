@@ -13,6 +13,12 @@ feasibility tool, ``MlxRunner`` is the fast tool.
 
 Quality dial (``runtime.mlx_quant``): ``bf16`` (lossless) | ``int8``
 (near-lossless, default) | ``int4`` (fast tier, mild quality cost).
+
+M5 optimisations wired through to mlx-lm kwargs:
+- ``max_kv_size``: sliding KV window via RotatingKVCache (from ``kv_window``).
+- ``kv_bits``:     native MLX KV-cache quantisation  (from ``kv_quant``).
+- ``draft_model``: speculative decoding — 2-4× throughput on suitable prompts
+                   (from ``mlx_draft_model``; ignored when kv_window is set).
 """
 from __future__ import annotations
 
@@ -21,6 +27,7 @@ import re
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 from ..config import AppConfig
 from ..metrics import RunMetrics, RunResult
@@ -44,6 +51,7 @@ class MlxRunner:
             )
         # Cached after first load; None until _ensure_loaded() is called.
         self._mlx_model = None
+        self._mlx_draft_model = None
         self.tokenizer = None  # exposed so run_chat() can build the chat template
 
     def _resolve_model_path(self) -> str:
@@ -86,16 +94,60 @@ class MlxRunner:
         LOGGER.info("mlx_loading", extra={"model_path": model_path, "quant": self.mlx_quant})
         self._mlx_model, self.tokenizer = load(model_path)
 
+        # Load the draft model for speculative decoding if configured.
+        draft_id = self.config.runtime.mlx_draft_model
+        if draft_id:
+            LOGGER.info("mlx_loading_draft", extra={"draft_model": draft_id})
+            try:
+                draft_model, _ = load(draft_id)
+                self._mlx_draft_model = draft_model
+                LOGGER.info("mlx_draft_loaded", extra={"draft_model": draft_id})
+            except Exception as exc:
+                LOGGER.warning(
+                    "mlx_draft_load_failed",
+                    extra={"draft_model": draft_id, "error": str(exc)},
+                )
+                self._mlx_draft_model = None
+
     def load(self) -> None:
         """Pre-load the MLX model and tokenizer (used by run_chat for warm-start)."""
         self._ensure_loaded()
+
+    def _gen_kwargs(self) -> dict[str, Any]:
+        """Build mlx-lm generation kwargs from the active config.
+
+        Maps SWLP runtime settings to the kwargs accepted by
+        ``mlx_lm.stream_generate`` / ``generate_step``:
+
+        - ``kv_window > 0``  →  ``max_kv_size`` (RotatingKVCache sliding window)
+        - ``kv_quant int4``  →  ``kv_bits=4``   (native MLX KV quantisation)
+
+        Note: mlx-lm drops ``max_kv_size`` silently when ``draft_model`` is
+        provided, so both can always be passed — speculative decoding takes
+        precedence over the KV window.
+        """
+        kwargs: dict[str, Any] = {}
+        kv_window = self.config.runtime.kv_window
+        if kv_window > 0:
+            kwargs["max_kv_size"] = kv_window
+        if self.config.runtime.kv_quant == "int4":
+            kwargs["kv_bits"] = 4
+        return kwargs
 
     def stream_tokens(self, prompt: str, max_tokens: int = 512) -> Iterator[str]:
         """Yield text fragments from ``mlx_lm.stream_generate`` as they arrive."""
         from mlx_lm import stream_generate
 
         self._ensure_loaded()
-        for resp in stream_generate(self._mlx_model, self.tokenizer, prompt, max_tokens=max_tokens):
+        kwargs = self._gen_kwargs()
+        for resp in stream_generate(
+            self._mlx_model,
+            self.tokenizer,
+            prompt,
+            max_tokens=max_tokens,
+            draft_model=self._mlx_draft_model,
+            **kwargs,
+        ):
             if resp.text:
                 yield resp.text
 
@@ -118,9 +170,17 @@ class MlxRunner:
         generated_tokens = 0
         gen_tps: float | None = None
 
+        kwargs = self._gen_kwargs()
         gen_start = time.perf_counter()
         last = gen_start
-        for resp in stream_generate(self._mlx_model, self.tokenizer, prompt, max_tokens=max_new):
+        for resp in stream_generate(
+            self._mlx_model,
+            self.tokenizer,
+            prompt,
+            max_tokens=max_new,
+            draft_model=self._mlx_draft_model,
+            **kwargs,
+        ):
             now = time.perf_counter()
             per_token_latency.append(now - last)
             last = now

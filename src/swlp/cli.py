@@ -86,6 +86,8 @@ def _apply_overrides(config: AppConfig, args: argparse.Namespace) -> AppConfig:
                 )
     if args.quant is not None:
         config.runtime.mlx_quant = args.quant
+    if getattr(args, "draft_model", None):
+        config.runtime.mlx_draft_model = resolve_model(args.draft_model)
     if args.window is not None:
         config.runtime.swlp_window_size = args.window
     if args.profile:
