@@ -25,8 +25,11 @@ from __future__ import annotations
 import json
 import logging
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .. import codec
 
 LOGGER = logging.getLogger(__name__)
 
@@ -48,6 +51,18 @@ class ShardManifest:
     # Phase 17: file format for layer shards: "safetensors" (new) or "pt" (legacy).
     # Defaulted to "pt" so old manifests (missing this field) still load correctly.
     shard_format: str = "pt"
+    # Lossless layer-shard compression: "none" or "swz" (zipnn container,
+    # produced by compress_shards). Defaulted so old manifests still load.
+    shard_compression: str = "none"
+    # Phase 25 (MoE): expert weights live in per-layer ``.experts.safetensors``
+    # banks when ``expert_bank`` is true; ``num_experts``/``top_k`` describe the
+    # routing. Zero/False for dense models — old manifests load unchanged.
+    num_experts: int = 0
+    top_k: int = 0
+    expert_bank: bool = False
+    # Round-1 audit: per-layer expert-bank bytes (MB). layer_weight_mb is
+    # dense-only; the expert cache budgets against this field instead.
+    expert_weight_mb: float = 0.0
 
 
 @dataclass
@@ -76,6 +91,7 @@ def shard_model_by_layer(
     output_dir: str | Path,
     dtype_str: str = "float16",
     cache_dir: str | None = None,
+    progress: Callable[[int, int, float], None] | None = None,
 ) -> ShardManifest:
     """Split a HF model into per-layer ``.pt`` shards by streaming from safetensors.
 
@@ -100,12 +116,18 @@ def shard_model_by_layer(
 
     cfg = AutoConfig.from_pretrained(str(local_path))
     model_type = getattr(cfg, "model_type", "unknown")
+    # Multimodal wrappers (e.g. qwen3_5) nest the decoder under text_config.
+    cfg = cfg.get_text_config()
     num_layers = int(getattr(cfg, "num_hidden_layers", 0) or getattr(cfg, "n_layer", 0))
     if num_layers <= 0:
         raise ValueError(f"Could not determine layer count for {model_id}")
 
     is_gpt2 = any(k.startswith("transformer.h.") for k in weight_map)
-    layer_prefix = "transformer.h." if is_gpt2 else "model.layers."
+    # Multimodal checkpoints keep the text decoder under model.language_model.*
+    text_prefix = "model.language_model." if any(
+        k.startswith("model.language_model.layers.") for k in weight_map
+    ) else "model."
+    layer_prefix = "transformer.h." if is_gpt2 else f"{text_prefix}layers."
     LOGGER.info(
         "shard_model_layout",
         extra={"model_type": model_type, "num_layers": num_layers, "gpt2_layout": is_gpt2},
@@ -117,42 +139,189 @@ def shard_model_by_layer(
     output_path.mkdir(parents=True, exist_ok=True)
 
     total_bytes = 0
+    dense_bytes = 0
+    expert_bytes_total = 0
+    has_experts = False
     for i in range(num_layers):
         layer_state = _read_prefixed(weight_map, f"{layer_prefix}{i}.", dtype)
         if not layer_state:
             raise ValueError(f"No weights found for layer {i} ({layer_prefix}{i}.*)")
+        # Phase 25: MoE expert tensors go to a separate bank file so the dense
+        # stream never re-reads expert bytes and experts can be range-read.
+        from .expert_bank import split_expert_tensors
+
+        dense_state, expert_state = split_expert_tensors(layer_state)
+        if expert_state:
+            bank_path = output_path / f"layer_{i:03d}.experts.safetensors"
+            _save_safetensors(expert_state, bank_path)
+            has_experts = True
+            bank_bytes = bank_path.stat().st_size
+            total_bytes += bank_bytes
+            expert_bytes_total += bank_bytes
         # Phase 17: write as .safetensors for zero-copy mmap loading.
         layer_path = output_path / f"layer_{i:03d}.safetensors"
-        _save_safetensors(layer_state, layer_path)
+        _save_safetensors(dense_state, layer_path)
         layer_bytes = layer_path.stat().st_size
         total_bytes += layer_bytes
+        dense_bytes += layer_bytes
         LOGGER.info(
             "shard_layer",
             extra={"layer": i, "total": num_layers, "mb": round(layer_bytes / 1e6, 1)},
         )
+        if progress is not None:
+            progress(i + 1, num_layers, layer_bytes / 1e6)
         del layer_state
 
-    _stream_save_embed(weight_map, output_path / "embed.pt", is_gpt2, dtype)
+    _stream_save_embed(weight_map, output_path / "embed.pt", is_gpt2, dtype, text_prefix)
     LOGGER.info("shard_saved_embed")
-    _stream_save_lm_head(weight_map, output_path / "lm_head.pt", dtype)
+    _stream_save_lm_head(weight_map, output_path / "lm_head.pt", dtype, text_prefix)
     LOGGER.info("shard_saved_lm_head")
 
-    layer_weight_mb = (total_bytes / num_layers) / 1e6 if num_layers else 0.0
+    # Phase 25 (round-1 audit): num_experts is also readable from routed-expert
+    # configs that do not use the plain "num_experts" spelling.
+    num_experts = int(
+        getattr(cfg, "num_experts", 0)
+        or getattr(cfg, "num_local_experts", 0)
+        or getattr(cfg, "num_routed_experts", 0)
+    )
+    top_k = int(getattr(cfg, "num_experts_per_tok", 0) or 0)
+    if has_experts and num_experts == 0:
+        # Config lacked expert fields (unusual layout) — derive from layer 0.
+        first = _read_prefixed(weight_map, f"{layer_prefix}0.", dtype)
+        from .expert_bank import expert_count as _expert_count
+
+        num_experts = _expert_count(first)
+    if has_experts:
+        from .expert_bank import EXPERT_INDEX_FILE, ExpertIndex
+
+        index = ExpertIndex.build(output_path, num_layers)
+        index.save(output_path / EXPERT_INDEX_FILE)
+        LOGGER.info("shard_expert_banks", extra={"layers": len(index.layers),
+                                                 "num_experts": num_experts})
+
+    # Dense-only per-layer size: the streaming window never holds expert
+    # bytes (banks are range-read by the ExpertScheduler), so residency and
+    # feasibility must plan against the dense stream. Expert bytes are kept
+    # separately for cache-budget reasoning.
+    layer_weight_mb = (dense_bytes / num_layers) / 1e6 if num_layers else 0.0
+    expert_weight_mb = (expert_bytes_total / num_layers) / 1e6 if num_layers else 0.0
     manifest = ShardManifest(
         model_id=model_id,
         num_layers=num_layers,
         layer_weight_mb=round(layer_weight_mb, 2),
         total_weight_mb=round(total_bytes / 1e6, 2),
+        expert_weight_mb=round(expert_weight_mb, 2),
         embed_file="embed.pt",
         lm_head_file="lm_head.pt",
         model_type=model_type,
         shard_format="safetensors",
+        num_experts=num_experts,
+        top_k=top_k,
+        expert_bank=has_experts,
     )
     _write_manifest(output_path, manifest)
     LOGGER.info(
         "shard_complete",
         extra={"num_layers": num_layers, "total_mb": manifest.total_weight_mb},
     )
+    return manifest
+
+
+def compress_shards(
+    shard_dir: str | Path,
+    progress: Callable[[int, int, float], None] | None = None,
+) -> ShardManifest:
+    """Losslessly compress a shard directory's layer files in place.
+
+    Each ``layer_XXX.safetensors`` becomes ``layer_XXX.safetensors.swz``
+    (~31% smaller, bit-exact). Per layer the original is deleted only after
+    ``codec.compress_bytes`` has roundtrip-verified the blob and the ``.swz``
+    file is fully on disk — peak extra disk is one compressed layer, and an
+    interrupted run resumes where it stopped (already-converted layers are
+    skipped; readers auto-detect both extensions per file).
+
+    ``embed.pt`` / ``lm_head.pt`` stay uncompressed: they are read once at
+    startup and the layer shards dominate the directory size.
+    """
+    shard_path = Path(shard_dir)
+    manifest = load_manifest(shard_path)
+    if manifest.shard_format != "safetensors":
+        raise ValueError(
+            f"compress_shards requires safetensors shards, got {manifest.shard_format!r}"
+        )
+    if manifest.weight_dtype not in ("float16", "bfloat16"):
+        raise ValueError(
+            f"unsupported weight_dtype for swz compression: {manifest.weight_dtype!r}"
+        )
+    for i in range(manifest.num_layers):
+        src = shard_path / f"layer_{i:03d}.safetensors"
+        dst = codec.compressed_path(src)
+        if dst.exists() and not src.exists():
+            LOGGER.debug("compress_shards_skip_done", extra={"layer": i})
+            continue
+        raw = src.read_bytes()
+        blob = codec.compress_bytes(raw)  # roundtrip-verified before src is deleted
+        tmp = dst.with_name(dst.name + ".tmp")
+        tmp.write_bytes(blob)
+        tmp.replace(dst)
+        src.unlink()
+        ratio = len(blob) / len(raw)
+        LOGGER.info(
+            "compress_shards_layer",
+            extra={"layer": i, "total": manifest.num_layers, "ratio": round(ratio, 4)},
+        )
+        if progress is not None:
+            progress(i + 1, manifest.num_layers, ratio)
+    manifest.shard_compression = "swz"
+    _write_manifest(shard_path, manifest)
+    LOGGER.info("compress_shards_complete", extra={"num_layers": manifest.num_layers})
+    return manifest
+
+
+def decompress_shards(
+    shard_dir: str | Path,
+    progress: Callable[[int, int, float], None] | None = None,
+) -> ShardManifest:
+    """Revert :func:`compress_shards`: restore plain ``.safetensors`` layers.
+
+    The throughput off-ramp for fast-SSD machines (≳3.5 GB/s sequential read),
+    where decompression contends with compute for memory bandwidth and costs
+    more than the read bytes it saves — see the ``codec`` module docstring.
+
+    Mirrors compress_shards' safety story: each layer is SHA-256-verified
+    against the digest stored at compress time, written to a temp file, and
+    atomically renamed before its ``.swz`` source is deleted. An interrupted
+    run resumes where it stopped.
+    """
+    shard_path = Path(shard_dir)
+    manifest = load_manifest(shard_path)
+    if manifest.shard_format != "safetensors":
+        raise ValueError(
+            f"decompress_shards requires safetensors shards, got {manifest.shard_format!r}"
+        )
+    for i in range(manifest.num_layers):
+        dst = shard_path / f"layer_{i:03d}.safetensors"
+        src = codec.compressed_path(dst)
+        if dst.exists() and _safetensors_file_ok(dst):
+            src.unlink(missing_ok=True)  # already reverted; drop a leftover .swz
+            LOGGER.debug("decompress_shards_skip_done", extra={"layer": i})
+            continue
+        blob = src.read_bytes()
+        raw = codec.decompress_bytes(blob, check_sha=True)
+        tmp = dst.with_name(dst.name + ".tmp")
+        tmp.write_bytes(raw)
+        tmp.replace(dst)
+        src.unlink()
+        ratio = len(blob) / len(raw)
+        LOGGER.info(
+            "decompress_shards_layer",
+            extra={"layer": i, "total": manifest.num_layers, "ratio": round(ratio, 4)},
+        )
+        if progress is not None:
+            progress(i + 1, manifest.num_layers, ratio)
+    manifest.shard_compression = "none"
+    _write_manifest(shard_path, manifest)
+    LOGGER.info("decompress_shards_complete", extra={"num_layers": manifest.num_layers})
     return manifest
 
 
@@ -225,7 +394,9 @@ def _read_one(weight_map: dict[str, Path], key: str, dtype):
         return handle.get_tensor(key).to(dtype)
 
 
-def _stream_save_embed(weight_map: dict[str, Path], path: Path, is_gpt2: bool, dtype) -> None:
+def _stream_save_embed(
+    weight_map: dict[str, Path], path: Path, is_gpt2: bool, dtype, text_prefix: str = "model."
+) -> None:
     import torch
 
     state: dict = {}
@@ -236,9 +407,21 @@ def _stream_save_embed(weight_map: dict[str, Path], path: Path, is_gpt2: bool, d
             state["wte"] = {"weight": wte}
         if wpe is not None:
             state["wpe"] = {"weight": wpe}
+        # Final LayerNorm is permanently on-device but belongs to no layer
+        # shard — persist it here, or the loader materialises it from
+        # uninitialized (freshly zeroed) memory: first-run zero logits.
+        ln_f: dict = {}
+        ln_w = _read_one(weight_map, "transformer.ln_f.weight", dtype)
+        ln_b = _read_one(weight_map, "transformer.ln_f.bias", dtype)
+        if ln_w is not None:
+            ln_f["weight"] = ln_w
+        if ln_b is not None:
+            ln_f["bias"] = ln_b
+        if ln_f:
+            state["ln_f"] = ln_f
     else:
-        embed = _read_one(weight_map, "model.embed_tokens.weight", dtype)
-        norm = _read_one(weight_map, "model.norm.weight", dtype)
+        embed = _read_one(weight_map, f"{text_prefix}embed_tokens.weight", dtype)
+        norm = _read_one(weight_map, f"{text_prefix}norm.weight", dtype)
         if embed is not None:
             state["embed_tokens"] = {"weight": embed}
         if norm is not None:
@@ -246,14 +429,16 @@ def _stream_save_embed(weight_map: dict[str, Path], path: Path, is_gpt2: bool, d
     torch.save(state, path)
 
 
-def _stream_save_lm_head(weight_map: dict[str, Path], path: Path, dtype) -> None:
+def _stream_save_lm_head(
+    weight_map: dict[str, Path], path: Path, dtype, text_prefix: str = "model."
+) -> None:
     import torch
 
     # Untied models expose lm_head.weight directly; tied models reuse the input
     # embedding — fall back to it so the lm_head shard is always populated.
     weight = _read_one(weight_map, "lm_head.weight", dtype)
     if weight is None:
-        weight = _read_one(weight_map, "model.embed_tokens.weight", dtype)
+        weight = _read_one(weight_map, f"{text_prefix}embed_tokens.weight", dtype)
     if weight is None:
         weight = _read_one(weight_map, "transformer.wte.weight", dtype)
     torch.save({"weight": weight} if weight is not None else {}, path)
@@ -312,6 +497,10 @@ def _write_manifest(output_path: Path, manifest: ShardManifest) -> None:
         "model_type": manifest.model_type,
         "weight_dtype": manifest.weight_dtype,
         "shard_format": manifest.shard_format,
+        "shard_compression": manifest.shard_compression,
+        "num_experts": manifest.num_experts,
+        "top_k": manifest.top_k,
+        "expert_bank": manifest.expert_bank,
     }
     (output_path / MANIFEST_FILE).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -322,23 +511,41 @@ def load_manifest(shard_dir: str | Path) -> ShardManifest:
     return ShardManifest(**data)
 
 
-def get_layer_path(shard_dir: str | Path, layer_idx: int, shard_format: str = "pt") -> Path:
+def get_layer_path(
+    shard_dir: str | Path,
+    layer_idx: int,
+    shard_format: str = "pt",
+    shard_compression: str = "none",
+) -> Path:
     """Return the path to a layer shard.
 
-    Prefer the explicit ``shard_format`` when known.  ``_read_shard`` in
-    ``StreamingScheduler`` also auto-detects by trying both extensions.
+    Prefer the explicit ``shard_format`` / ``shard_compression`` when known.
+    ``_shard_path`` in ``StreamingScheduler`` also auto-detects per file by
+    trying all extensions.
     """
     ext = "safetensors" if shard_format == "safetensors" else "pt"
-    return Path(shard_dir) / f"layer_{layer_idx:03d}.{ext}"
+    path = Path(shard_dir) / f"layer_{layer_idx:03d}.{ext}"
+    if shard_compression == "swz" and ext == "safetensors":
+        return codec.compressed_path(path)
+    return path
 
 
 def list_layer_paths(shard_dir: str | Path) -> list[Path]:
-    """Return sorted layer shard paths, preferring .safetensors over .pt."""
+    """Return sorted dense-layer shard paths (.safetensors, .swz, then .pt).
+
+    Expert banks (``layer_XXX.experts.safetensors``) are excluded — they are
+    range-read by the ExpertScheduler, never streamed whole.
+    """
     d = Path(shard_dir)
-    st_paths = sorted(d.glob("layer_*.safetensors"))
-    if st_paths:
-        return st_paths
-    return sorted(d.glob("layer_*.pt"))
+    for pattern in (
+        "layer_[0-9][0-9][0-9].safetensors",
+        "layer_[0-9][0-9][0-9].safetensors.swz",
+        "layer_[0-9][0-9][0-9].pt",
+    ):
+        paths = sorted(d.glob(pattern))
+        if paths:
+            return paths
+    return []
 
 
 # ── shard-integrity check ─────────────────────────────────────────────────────
@@ -381,11 +588,50 @@ def _safetensors_file_ok(path: Path) -> bool:
         return False
 
 
+def _swz_file_ok(path: Path) -> bool:
+    """Cheap corruption check for a compressed ``.swz`` shard.
+
+    Validates the container header (magic, positive raw size) and that a
+    payload follows it. Does not decode — use ``codec.verify_blob`` for the
+    full offline check.
+    """
+    try:
+        if not path.is_file() or path.stat().st_size <= codec.HEADER_SIZE:
+            return False
+        with path.open("rb") as fh:
+            head = fh.read(codec.HEADER_SIZE)
+        return codec.decompressed_size(head) > 0
+    except (OSError, codec.CodecError):
+        return False
+
+
 def _shard_file_ok(path: Path) -> bool:
     """Dispatch to the correct integrity check based on file extension."""
+    if path.suffix == codec.COMPRESSED_SUFFIX:
+        return _swz_file_ok(path)
     if path.suffix == ".safetensors":
         return _safetensors_file_ok(path)
     return _pt_file_ok(path)
+
+
+def _existing_layer_path(shard_dir: Path, layer_idx: int, manifest: ShardManifest) -> Path | None:
+    """First existing on-disk variant of a layer — manifest-preferred first.
+
+    A directory mid-conversion (interrupted ``compress_shards``) legitimately
+    holds a mix of ``.safetensors`` and ``.swz`` layers; readers auto-detect
+    per file, so verification accepts either variant.
+    """
+    preferred = get_layer_path(
+        shard_dir, layer_idx, manifest.shard_format, manifest.shard_compression
+    )
+    candidates = [preferred]
+    if manifest.shard_format == "safetensors":
+        st = get_layer_path(shard_dir, layer_idx, "safetensors")
+        candidates.extend([st, codec.compressed_path(st)])
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def verify_shards(shard_dir: str | Path) -> ShardIntegrityReport:
@@ -415,10 +661,30 @@ def verify_shards(shard_dir: str | Path) -> ShardIntegrityReport:
         elif not _pt_file_ok(target):
             corrupt.append(name)
     for i in range(manifest.num_layers):
-        layer_path = get_layer_path(shard_path, i, manifest.shard_format)
-        if not layer_path.is_file():
-            missing.append(layer_path.name)
+        layer_path = _existing_layer_path(shard_path, i, manifest)
+        if layer_path is None:
+            expected = get_layer_path(
+                shard_path, i, manifest.shard_format, manifest.shard_compression
+            )
+            missing.append(expected.name)
         elif not _shard_file_ok(layer_path):
             corrupt.append(layer_path.name)
+        # Phase 25: expert banks are separate files the loader range-reads.
+        if manifest.expert_bank:
+            bank = shard_path / f"layer_{i:03d}.experts.safetensors"
+            if not bank.is_file():
+                # v1 shard dirs (pre-split) keep experts inside the layer
+                # file — verify that instead of trusting the layout blind.
+                from .expert_bank import file_has_expert_tensors
+
+                if (
+                    layer_path is not None
+                    and layer_path.suffix == ".safetensors"
+                    and file_has_expert_tensors(layer_path)
+                ):
+                    continue
+                missing.append(bank.name)
+            elif not _safetensors_file_ok(bank):
+                corrupt.append(bank.name)
 
     return ShardIntegrityReport(ok=not missing and not corrupt, missing=missing, corrupt=corrupt)

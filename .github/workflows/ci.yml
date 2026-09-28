@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: macos-15   # Apple Silicon: SWLP is an Apple-only project
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package
+        run: pip install -e ".[dev,codec,apple]"
+
+      - name: Lint
+        run: ruff check src/
+
+      - name: Test
+        run: pytest --tb=short --cov=swlp --cov-report=term-missing --cov-fail-under=65

@@ -131,10 +131,13 @@ def sparsify_shards(
 ) -> dict[str, int]:
     """Convert an existing shard directory to sparse-encoded shards.
 
-    Reads every ``layer_*.pt`` file from ``shard_dir``, applies
+    Reads every layer shard (``layer_XXX.safetensors`` — the current format —
+    or legacy ``layer_XXX.pt``) from ``shard_dir``, applies
     ``encode_sparse(threshold=threshold)``, and writes the result to
-    ``output_dir``.  Non-layer files (``embed.pt``, ``lm_head.pt``,
-    ``shard_manifest.json``) are copied unchanged.
+    ``output_dir`` in the same format.  ``embed.pt`` / ``lm_head.pt`` /
+    ``shard_manifest.json`` are copied unchanged; expert banks
+    (``layer_XXX.experts.safetensors``) are copied unchanged (COO targets
+    pruned dense checkpoints; routed experts are bank-managed).
 
     Returns a summary: ``{"layers": int, "tensors_sparsified": int}``.
     """
@@ -144,28 +147,51 @@ def sparsify_shards(
     layers = 0
     tensors_sparsified = 0
 
-    for pt_file in sorted(shard_dir.glob("*.pt")):
-        state = torch.load(str(pt_file), map_location="cpu", weights_only=True)
+    def _process(state: dict, name: str, save) -> None:
+        nonlocal layers, tensors_sparsified
         dense_count = sum(1 for k in state if not k.endswith(_IDX_SUFFIX))
         encoded = encode_sparse(state, threshold=threshold)
         sparse_count = sum(1 for k in encoded if k.endswith(_IDX_SUFFIX))
         tensors_sparsified += sparse_count
-        torch.save(encoded, str(output_dir / pt_file.name))
+        save(encoded)
         layers += 1
         LOGGER.info(
             "sparsify_shard",
             extra={
-                "file": pt_file.name,
+                "file": name,
                 "dense_tensors": dense_count,
                 "sparse_tensors": sparse_count,
             },
         )
 
-    # Copy the manifest if present.
-    manifest = shard_dir / "shard_manifest.json"
-    if manifest.exists():
-        import shutil
-        shutil.copy(manifest, output_dir / "shard_manifest.json")
+    # Current format first: per-layer safetensors (banks excluded — copied).
+    import shutil
+
+    from safetensors.torch import load_file as _st_load
+    from safetensors.torch import save_file as _st_save
+
+    for st_file in sorted(shard_dir.glob("layer_[0-9][0-9][0-9].safetensors")):
+        _process(
+            _st_load(str(st_file)),
+            st_file.name,
+            lambda encoded, path=output_dir / st_file.name: _st_save(encoded, str(path)),
+        )
+    for bank in sorted(shard_dir.glob("layer_*.experts.safetensors")):
+        shutil.copy(bank, output_dir / bank.name)
+    # Legacy format: per-layer .pt files.
+    for pt_file in sorted(shard_dir.glob("layer_[0-9][0-9][0-9].pt")):
+        state = torch.load(str(pt_file), map_location="cpu", weights_only=True)
+        _process(
+            state,
+            pt_file.name,
+            lambda encoded, path=output_dir / pt_file.name: torch.save(encoded, str(path)),
+        )
+
+    # Copy the always-resident modules and the manifest unchanged.
+    for name in ("embed.pt", "lm_head.pt", "shard_manifest.json"):
+        src = shard_dir / name
+        if src.exists():
+            shutil.copy(src, output_dir / name)
 
     LOGGER.info(
         "sparsify_shards_done",

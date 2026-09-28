@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .run_report import _coerce_float
+
 
 def _load_json(path: Path) -> list[dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -23,16 +25,6 @@ def load_suite_cases(path: Path) -> list[dict[str, Any]]:
     if path.suffix.lower() == ".csv":
         return _load_csv(path)
     raise ValueError(f"Unsupported suite format: {path.suffix}")
-
-
-def _coerce_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str) and value.strip():
-        return float(value)
-    return None
 
 
 def _coerce_bool(value: Any) -> bool | None:
@@ -74,8 +66,6 @@ def print_suite_report(path: Path) -> None:
 
     baseline_tp = _avg_throughput(baseline_success)
     swlp_tp = _avg_throughput(swlp_success)
-    baseline_vram = _avg_metric(baseline_success, "vram_peak_bytes")
-    swlp_vram = _avg_metric(swlp_success, "vram_peak_bytes")
     baseline_ram = _avg_metric(baseline_success, "ram_peak_bytes")
     swlp_ram = _avg_metric(swlp_success, "ram_peak_bytes")
 
@@ -95,10 +85,6 @@ def print_suite_report(path: Path) -> None:
     print(f"Baseline runs: {len(baseline_cases)} | SWLP runs: {len(swlp_cases)}")
     print(f"Baseline avg throughput: {baseline_tp or 0.0:.2f} tok/s")
     print(f"SWLP avg throughput: {swlp_tp or 0.0:.2f} tok/s")
-    if baseline_vram or swlp_vram:
-        baseline_vram_mb = (baseline_vram or 0.0) / (1024 * 1024)
-        swlp_vram_mb = (swlp_vram or 0.0) / (1024 * 1024)
-        print(f"Avg VRAM: baseline={baseline_vram_mb:.1f} MB | swlp={swlp_vram_mb:.1f} MB")
     if baseline_ram or swlp_ram:
         baseline_ram_mb = (baseline_ram or 0.0) / (1024 * 1024)
         swlp_ram_mb = (swlp_ram or 0.0) / (1024 * 1024)

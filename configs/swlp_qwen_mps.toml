@@ -1,5 +1,5 @@
 # SWLP config for Qwen2.5-14B-Instruct on M5 (Apple Silicon, MPS).
-# Streams per-layer weights from ./shards/qwen2.5-14b via StreamingScheduler.
+# Streams per-layer weights from ./shards/qwen-14b via StreamingScheduler.
 
 [model]
 model_id = "Qwen/Qwen2.5-14B-Instruct"
@@ -38,5 +38,5 @@ kv_memory_budget_mb = 4096
 kv_compression = false
 kv_compression_level = 0
 kv_tiering = false
-shard_dir = "./shards/qwen2.5-14b"
+shard_dir = "./shards/qwen-14b"
 swlp_residency = "auto"

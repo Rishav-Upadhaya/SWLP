@@ -45,14 +45,16 @@ def print_swlp_help() -> None:
         print(f"  {command}{suffix}")
 
     # ── header ────────────────────────────────────────────────────────────
-    print(f"\n{b}SWLP{r}  ─  Stream large LLMs on consumer hardware, without quantization.\n")
+    print(f"\n{b}SWLP{r}  ─  LLMs on Apple Silicon: fast when they fit, "
+          f"lossless when they don't.\n")
     rule()
 
     # ── QUICK START ───────────────────────────────────────────────────────
     section("QUICK START")
-    cmd("swlp download --model mistral-7b",               "① download & shard once  (~14 GB)")
-    cmd("swlp chat --shard-dir ./shards/mistral-7b",      "② streaming chat  (any RAM)")
-    cmd('swlp --shard-dir ./shards/mistral-7b --prompt "…"', "③ single inference")
+    cmd("swlp doctor",                          "① what this Mac can run, and the tuning to apply")
+    cmd("swlp chat qwen-7b --quant int4",       "② fast chat — model fits in RAM")
+    cmd("swlp run mistral-7b --prompt \"…\"",    "③ download + shard + run, one command")
+    cmd("swlp serve mistral-7b",                "④ OpenAI-compatible server on :8080")
 
     # ── DOWNLOAD ──────────────────────────────────────────────────────────
     section("DOWNLOAD")
@@ -62,11 +64,13 @@ def print_swlp_help() -> None:
     cmd("swlp download --model <hf-id>",     "any HuggingFace model ID")
 
     # ── INFERENCE ─────────────────────────────────────────────────────────
-    section("INFERENCE")
-    cmd('swlp --shard-dir ./shards/<model> --prompt "…"', "streaming  (works in any RAM)")
-    cmd('swlp --model <model> --backend mlx --quant int8 --prompt "…"',
-        "MLX native  (Apple Silicon)")
-    cmd('swlp --model <model> --prompt "…"', "HuggingFace  (full model)")
+    section("TWO WAYS TO RUN")
+    print(f"  {b}fits in RAM{r} — native MLX, interactive speed")
+    cmd('swlp --model <model> --quant int4 --prompt "…"', "~28 tok/s, near-lossless")
+    cmd('swlp --model <model> --quant int8 --prompt "…"', "~16 tok/s, byte-identical to fp16")
+    blank()
+    print(f"  {b}bigger than RAM{r} — FP16 layer streaming, exact, slow")
+    cmd('swlp --shard-dir ./shards/<model> --prompt "…"', "peak RAM ≈ 2 × one layer")
     cmd('swlp --backend mock --prompt "…"',  "offline smoke-test, no model needed")
 
     # ── CHAT ──────────────────────────────────────────────────────────────
@@ -83,9 +87,19 @@ def print_swlp_help() -> None:
     flag("--window <n>",      "sliding window depth  (default: 2)")
     flag("--quant <tier>",    "MLX quantization: bf16 | int8 | int4  (implies --backend mlx)")
     flag("--max-tokens <n>",  "max new tokens to generate")
-    flag("--device <dev>",    "auto | cuda | mps | cpu")
+    flag("--device <dev>",    "auto | mps | cpu")
     flag("--json",            "print full metrics as JSON")
     flag("--profile",         "collect per-layer timing breakdown")
+
+    # ── APPLE SILICON TUNING ──────────────────────────────────────────────
+    section("APPLE SILICON TUNING")
+    flag("--kv-bits <4|8>",   "quantize KV cache — 4-bit is FASTER than fp16 here")
+    flag("--draft-model <m>", "speculative decoding: 1.9-2.1x, same family only")
+    flag("--draft-tokens <n>", "drafts per step (default 4; 4-6 is the sweet spot)")
+    flag("--max-kv-size <n>", "cap KV length; bounds long-context RAM (lossy)")
+    flag("--wired-limit <v>", "Metal wired ceiling: auto | off | <MB>  (default auto)")
+    blank()
+    print(f"  {d}Run `swlp doctor` — it prints the exact sysctl for this machine.{r}")
 
     # ── MISTRAL-7B END-TO-END ─────────────────────────────────────────────
     section("MISTRAL-7B  END-TO-END")
@@ -107,6 +121,7 @@ def print_swlp_help() -> None:
     ex("swlp benchmark --model mistral-7b --prompt-set short --warmup-runs 1 --report")
     ex("swlp suite     --suite configs/bench_suite.toml --report")
     ex("swlp simulate  --scenario configs/sim_m5.toml --report")
+    ex("swlp policy-report experiments/policy_matrix.csv")
     ex("swlp report    benchmarks/baseline-<timestamp>.json")
     ex("swlp suite-report  benchmarks/suite-<timestamp>.json")
 
@@ -118,7 +133,10 @@ def print_swlp_help() -> None:
 
     # ── MODEL TOOLS ───────────────────────────────────────────────────────
     section("MODEL TOOLS")
+    cmd("swlp doctor",                               "hardware check + per-model advice")
+    cmd("swlp models",                               "list aliases, sizes, HF ids")
     cmd("swlp validate-package ./shards/mistral-7b", "verify shard integrity")
+    cmd("swlp compress-shards ./shards/mistral-7b",  "lossless ~31% shrink  (--revert undoes)")
     cmd("swlp layer ./shards/mistral-7b 0",          "inspect layer 0 tensor shapes")
     cmd("swlp package <checkpoint> <output-dir>",    "package a raw checkpoint")
 

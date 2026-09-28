@@ -1,3 +1,10 @@
+"""Closed-form bottleneck model for `swlp simulate` — the *back-of-envelope*.
+
+No event loop and no queues: pure arithmetic over bandwidth, layer size and
+compute time, for scenario TOMLs in configs/sim_*.toml. The two discrete-event
+simulators live in core/simulator.py (tuner) and benchmark/event_simulator.py
+(policy lab) — see the note at the top of core/simulator.py.
+"""
 from __future__ import annotations
 
 import csv
@@ -21,7 +28,7 @@ class Scenario:
     context_tokens: int
     generate_tokens: int
     kv_bytes_per_token: int
-    vram_capacity_mb: float
+    device_memory_mb: float
     ram_capacity_mb: float
     pcie_bandwidth_gbps: float
     ram_bandwidth_gbps: float
@@ -41,9 +48,9 @@ class SimulationResult:
     compute_seconds_per_token: float
     transfer_seconds_per_token: float
     stall_seconds_per_token: float
-    vram_peak_mb: float
+    device_peak_mb: float
     ram_peak_mb: float
-    fits_vram: bool
+    fits_device: bool
     fits_ram: bool
     bottleneck: str
     recommendation: str
@@ -71,7 +78,7 @@ def load_scenario(path: Path) -> Scenario:
         context_tokens=int(data["context_tokens"]),
         generate_tokens=int(data["generate_tokens"]),
         kv_bytes_per_token=int(data["kv_bytes_per_token"]),
-        vram_capacity_mb=float(data["vram_capacity_mb"]),
+        device_memory_mb=float(data["device_memory_mb"]),
         ram_capacity_mb=float(data["ram_capacity_mb"]),
         pcie_bandwidth_gbps=float(data["pcie_bandwidth_gbps"]),
         ram_bandwidth_gbps=float(data["ram_bandwidth_gbps"]),
@@ -82,7 +89,7 @@ def load_scenario(path: Path) -> Scenario:
 
 
 def _bandwidth_to_mb_per_s(gbps: float) -> float:
-    return gbps * 1024 / 8
+    return gbps * 1024
 
 
 def _transfer_seconds_per_layer(scenario: Scenario) -> float:
@@ -142,25 +149,25 @@ def _estimate_memory_pressure(scenario: Scenario, window_size: int) -> tuple[flo
     kv_mb = (
         scenario.kv_bytes_per_token * (scenario.context_tokens + scenario.generate_tokens)
     ) / BYTES_PER_MB
-    vram_peak_mb = window_size * scenario.layer_weight_mb + kv_mb
+    device_peak_mb = window_size * scenario.layer_weight_mb + kv_mb
     if scenario.disk_staging:
         ram_peak_mb = window_size * scenario.layer_weight_mb
     else:
         ram_peak_mb = 0.0
-    return vram_peak_mb, ram_peak_mb
+    return device_peak_mb, ram_peak_mb
 
 
-def _bottleneck(compute: float, transfer: float, stall: float, fits_vram: bool) -> str:
-    if not fits_vram:
+def _bottleneck(compute: float, transfer: float, stall: float, fits_device: bool) -> str:
+    if not fits_device:
         return "memory"
     if stall > compute * 0.2 and transfer >= compute:
         return "transfer"
     return "compute"
 
 
-def _recommendation(fits_vram: bool, throughput: float, bottleneck: str) -> str:
-    if not fits_vram:
-        return "not viable (VRAM overflow)"
+def _recommendation(fits_device: bool, throughput: float, bottleneck: str) -> str:
+    if not fits_device:
+        return "not viable (device memory overflow)"
     if throughput <= 0:
         return "not viable (zero throughput)"
     if bottleneck == "transfer":
@@ -180,11 +187,11 @@ def simulate_scenario(scenario: Scenario) -> list[SimulationResult]:
             if total_generate_seconds > 0
             else 0.0
         )
-        vram_peak_mb, ram_peak_mb = _estimate_memory_pressure(scenario, window_size)
-        fits_vram = vram_peak_mb <= scenario.vram_capacity_mb
+        device_peak_mb, ram_peak_mb = _estimate_memory_pressure(scenario, window_size)
+        fits_device = device_peak_mb <= scenario.device_memory_mb
         fits_ram = ram_peak_mb <= scenario.ram_capacity_mb
-        bottleneck = _bottleneck(compute_seconds, transfer_seconds, stall_seconds, fits_vram)
-        recommendation = _recommendation(fits_vram, throughput, bottleneck)
+        bottleneck = _bottleneck(compute_seconds, transfer_seconds, stall_seconds, fits_device)
+        recommendation = _recommendation(fits_device, throughput, bottleneck)
         results.append(
             SimulationResult(
                 scenario=scenario.name,
@@ -196,9 +203,9 @@ def simulate_scenario(scenario: Scenario) -> list[SimulationResult]:
                 compute_seconds_per_token=compute_seconds,
                 transfer_seconds_per_token=transfer_seconds,
                 stall_seconds_per_token=stall_seconds,
-                vram_peak_mb=vram_peak_mb,
+                device_peak_mb=device_peak_mb,
                 ram_peak_mb=ram_peak_mb,
-                fits_vram=fits_vram,
+                fits_device=fits_device,
                 fits_ram=fits_ram,
                 bottleneck=bottleneck,
                 recommendation=recommendation,

@@ -101,3 +101,34 @@ def test_sparsify_shards_round_trip(tmp_path: Path) -> None:
     dec = decode_sparse(enc)
     assert torch.equal(dec["weight"], w)
     assert torch.equal(dec["bias"], b)  # bias kept dense
+
+
+def test_sparsify_shards_safetensors_round_trip(tmp_path: Path) -> None:
+    """Phase 24 round-1 fix: sparsify operates on the CURRENT safetensors
+    shard format (previously legacy .pt only), keeps embed/lm_head/manifest
+    out of the layer count, and decodes bit-exactly."""
+    from safetensors.torch import load_file, save_file
+
+    shard_dir = tmp_path / "shards"
+    sparse_dir = tmp_path / "sparse"
+    shard_dir.mkdir()
+
+    w = torch.zeros(8, 8)
+    w[1, 3] = 2.0
+    save_file({"weight": w}, str(shard_dir / "layer_000.safetensors"))
+    save_file({"weight": w.clone()}, str(shard_dir / "layer_001.safetensors"))
+    # Bank + always-resident files must be copied, not sparsified/counted.
+    save_file({"w": w.clone()}, str(shard_dir / "layer_000.experts.safetensors"))
+    torch.save({"x": torch.zeros(2)}, str(shard_dir / "embed.pt"))
+    (shard_dir / "shard_manifest.json").write_text("{}")
+
+    summary = sparsify_shards(shard_dir, sparse_dir, threshold=0.5)
+    assert summary["layers"] == 2, "banks/embed must not count as layers"
+
+    enc = load_file(str(sparse_dir / "layer_000.safetensors"))
+    assert is_sparse_encoded(dict(enc))
+    dec = decode_sparse(dict(enc))
+    assert torch.equal(dec["weight"], w)
+    assert (sparse_dir / "embed.pt").exists()
+    assert (sparse_dir / "shard_manifest.json").exists()
+    assert (sparse_dir / "layer_000.experts.safetensors").exists()

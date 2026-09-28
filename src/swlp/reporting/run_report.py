@@ -30,16 +30,12 @@ def _format_bytes(value: int | None) -> str:
 
 def _mean(values: Iterable[float]) -> float | None:
     values = list(values)
-    if not values:
-        return None
-    return sum(values) / len(values)
+    return statistics.fmean(values) if values else None
 
 
 def _median(values: Iterable[float]) -> float | None:
-    values = sorted(values)
-    if not values:
-        return None
-    return values[len(values) // 2]
+    values = list(values)
+    return statistics.median(values) if values else None
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -147,7 +143,6 @@ def print_report(path: Path) -> None:
         _coerce_float(m.get("throughput_tokens_per_second")) for m in metrics_records
     ]
     forward_values = [_coerce_float(m.get("forward_seconds")) for m in metrics_records]
-    vram_values = [_coerce_float(m.get("vram_peak_bytes")) for m in metrics_records]
     ram_values = [_coerce_float(m.get("ram_peak_bytes")) for m in metrics_records]
 
     load_mean = _mean(v for v in load_values if v is not None)
@@ -156,7 +151,6 @@ def print_report(path: Path) -> None:
     ttft_mean = _mean(v for v in ttft_values if v is not None)
     forward_mean = _mean(v for v in forward_values if v is not None)
     throughput_mean = _mean(v for v in throughput_values if v is not None)
-    vram_peak = max((int(v) for v in vram_values if v is not None), default=None)
     ram_peak = max((int(v) for v in ram_values if v is not None), default=None)
 
     per_token_latencies: list[float] = []
@@ -201,7 +195,7 @@ def print_report(path: Path) -> None:
         f" {_format_seconds(per_token_avg)}/{_format_seconds(per_token_p50)}"
         f" | Throughput: {_format_rate(throughput_mean)}"
     )
-    print(f"Peak VRAM: {_format_bytes(vram_peak)} | Peak RAM: {_format_bytes(ram_peak)}")
+    print(f"Peak RAM: {_format_bytes(ram_peak)}")
     print(f"Bound: {_bound_label(preprocess_mean, generate_mean)}")
     print("Metrics tracked: " + ", ".join(METRIC_FIELDS))
 

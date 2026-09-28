@@ -1,5 +1,10 @@
 # SWLP — Sliding Window Layer Pipeline
 
+[![CI](https://github.com/Rishav-Upadhaya/SWLP/actions/workflows/ci.yml/badge.svg)](https://github.com/Rishav-Upadhaya/SWLP/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
 > **Run a 26 GB model on a 16 GB machine. No quantization. 1.7 GB peak RAM.**
 
 That's not a typo. SWLP streams transformer layers one at a time — SSD → RAM → compute → evict. Only *W* layers ever live in memory. The rest stay on disk. A 26 GB model needs only **1.7 GB RAM**. A 44 GB model needs **3.8 GB**. The weights are never quantized. Every parameter stays full FP16.
@@ -15,12 +20,38 @@ For **interactive speed** on Apple Silicon (when the model fits compressed), SWL
 | | FP16 Streaming | MLX Interactive |
 |---|---|---|
 | **When to use** | Model exceeds your RAM, even quantized | Apple Silicon, need conversational speed |
-| **Speed** | 0.1–0.5 tok/s | 16–28 tok/s |
+| **Speed** | ~0.17–0.21 tok/s | 16–28 tok/s |
 | **Quality** | Exact FP16 — zero compromise | int8: byte-identical to FP16 |
 | **RAM needed** | ~2 × layer size (e.g. 1.7 GB for a 26 GB model; 3.8 GB for a 44 GB model) | ~half the model size |
 | **How to invoke** | `--shard-dir ./shards/model` | `--backend mlx --quant int8` |
 
 ---
+
+## Start Here
+
+1. [Install SWLP](#installation).
+2. One command — download, shard, and run: `swlp run mistral-7b --prompt "Hello"`.
+   Already-sharded models are detected and reused. `swlp pull mistral-7b`
+   does the same without running.
+3. Or serve it OpenAI-style: `swlp serve mistral-7b` → `http://127.0.0.1:8080/v1/chat/completions`.
+4. Run `swlp doctor` to get the recommended command for your hardware.
+
+## Contents
+
+- [Benchmarks](#benchmarks)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Usage](#usage)
+- [How It Works](#how-it-works)
+- [Configuration](#configuration)
+- [Supported Models](#supported-models)
+- [Development](#development)
+- [Limitations](#limitations)
+- [Platform Support](#platform-support)
+- [Documentation](#documentation)
+- [Support and Contributing](#support-and-contributing)
+- [Citation](#citation)
+- [License](#license)
 
 ## Benchmarks
 
@@ -33,22 +64,28 @@ Measured on **Apple M5, 16 GB unified memory**, greedy decoding, Mistral-7B FP16
 | Ollama (Q4_K_M) | 28 | 4-bit quantized | Fastest — but not FP16 |
 | **SWLP MLX int8** | **16** | **Byte-identical to FP16 ✅** | Native quantized matmul on Apple Silicon |
 | SWLP MLX int4 | 28 | Near-lossless | Faster; minor wording drift |
-| **SWLP FP16 streaming** | **0.50** | **Exact FP16 ✅** | The only option when model exceeds RAM |
-| AirLLM FP16 streaming | 0.21 | Exact FP16 | No prefetch — I/O blocks compute |
+| **SWLP FP16 streaming** | **~0.17–0.21** † | **Exact FP16 ✅** | Prefetch overlaps disk I/O with compute; bounded peak RAM |
+| AirLLM FP16 streaming | ~0.085 † | Exact FP16 | **~2.5× slower**; more resident RAM |
 | Full FP16 load (HF / MLX naive) | ❌ OOM | — | 14 GB model doesn't fit 16 GB |
 
-SWLP MLX int8 is byte-identical to FP16 on Mistral-7B (measured). Ollama Q4_K_M is 4-bit — a different quality tier. For models that don't fit at all, **SWLP streaming is the only viable FP16 option**.
+SWLP MLX int8 is byte-identical to FP16 on Mistral-7B (measured). Ollama Q4_K_M is 4-bit — a different quality tier. For FP16 models that exceed RAM, the alternatives are layer streaming (AirLLM), disk offload (HF Accelerate `device_map="auto"` + `offload_folder`), and mmap-backed loading (llama.cpp with an F16 GGUF, paged through the OS cache). SWLP's contribution is an explicit sliding window with prefetch, giving a bounded, predictable peak RSS; a head-to-head against llama.cpp F16 + mmap and Accelerate offload is on the roadmap.
 
-### The models nobody else can run on a 16 GB machine
+> † FP16-streaming figures are **warm-cache medians** (M5, Mistral-7B, W=2, greedy, airllm 2.11.0), reproduced 2026-05-29. The physics ceiling is `SSD_bw / model_bytes` = **0.496 tok/s** (cold). The authoritative cold-SSD median is **0.174 tok/s** (Mistral-7B, 35% of the ceiling); the ~0.21 above is the warm-cache upper bound, and AirLLM's ~0.085 is its warm-cache median — see [`docs/benchmark_methodology.md`](docs/benchmark_methodology.md). Earlier drafts cited 0.42/0.50 tok/s for SWLP; those were single-run / warm-cache artifacts and are superseded.
+>
+> **Phase 20 update (2026-06-11):** a hot-path overhaul (single-read buffers, zero-copy shard parsing, worker-side device transfer) raised Mistral-7B direct-I/O streaming from **0.218 → 0.370 tok/s (+70%, 75% of the cold ceiling)** with byte-identical output; prefill is 2.5× faster. Formal multi-run cold/warm medians are being re-measured — see `docs/results.md` Phase 20.
+>
+> **Phase 21 update (2026-06-11):** draft-model speculative decoding (`--draft-model qwen-0.5b`): a ~1 GB resident drafter proposes tokens that the streamed target verifies in one disk sweep, with draft length adapting to acceptance. Qwen2.5-14B (28 GB FP16) went from 0.19 to **0.55–1.16 tok/s on a 16 GB M5 (2.9×–5.9×, workload-dependent)** — still byte-identical to plain greedy decoding. See `docs/results.md` Phase 21.
 
-| Model | Disk size | tok/s | Peak RAM | Feasible with other tools? |
+### Models larger than RAM, on a 16 GB machine
+
+| Model | Disk size | tok/s † | Peak RAM | Full FP16 load? |
 |-------|----------:|------:|--------:|:--------------------------:|
-| Mistral-7B | 14 GB | 0.50 | 1.1 GB | ❌ FP16 OOM everywhere |
-| Qwen2.5-14B | 26 GB | 0.19 | 1.7 GB | ❌ FP16 OOM everywhere |
-| Mistral-Small-24B | 44 GB | 0.08 | 3.8 GB | ❌ FP16 OOM everywhere |
-| Qwen2.5-32B | ~60 GB | — | — | ❌ FP16 OOM everywhere |
+| Mistral-7B | 14 GB | ~0.21 | 1.1 GB | ❌ OOM on naive full load |
+| Qwen2.5-14B | 26 GB | 0.19 | 1.7 GB | ❌ OOM on naive full load |
+| Mistral-Small-24B | 44 GB | 0.08 | 3.8 GB | ❌ OOM on naive full load |
+| Qwen2.5-32B | ~60 GB | — | — | ❌ OOM on naive full load |
 
-The first three rows are not quantized — actual FP16 weights, measured on an M5 16 GB machine. Qwen2.5-32B is architecture-verified but per-token measurements are pending (model download required).
+The first three rows are not quantized — actual FP16 weights, measured on an M5 16 GB machine (warm-cache; see the methodology note above). Qwen2.5-32B is architecture-verified but per-token measurements are pending (model download required). **The point of these rows is *feasibility*, not speed** — none of these fit in 16 GB as a full FP16 load, and SWLP runs them with a bounded peak RAM; the peak-RAM column is the headline, not tok/s.
 
 ### Batch throughput — the scaling principle
 
@@ -67,15 +104,17 @@ The sweep wall time is flat — batch-independent — so aggregate throughput sc
 
 ## Installation
 
-**Requirements:** Python ≥ 3.11
+**Requirements:** Python ≥ 3.11. The mock backend needs no model or accelerator.
+Real-model commands download checkpoints from Hugging Face, so they also need network access and
+free disk space at least equal to the model size shown in [Supported Models](#supported-models).
 
 ### uv (recommended)
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-git clone https://github.com/rishavupadhaya/swlp.git
-cd swlp
+git clone https://github.com/Rishav-Upadhaya/SWLP.git
+cd SWLP
 
 uv sync --extra dev                              # core + dev tools
 # uv sync --extra dev --extra apple             # + MLX backend (Apple Silicon)
@@ -87,8 +126,8 @@ source .venv/bin/activate
 ### pip
 
 ```bash
-git clone https://github.com/rishavupadhaya/swlp.git
-cd swlp
+git clone https://github.com/Rishav-Upadhaya/SWLP.git
+cd SWLP
 
 python -m venv .venv
 source .venv/bin/activate          # macOS / Linux
@@ -122,8 +161,11 @@ The file includes commented optional sections — just uncomment the lines you n
 
 ```bash
 swlp --backend mock --prompt "Hello, does SWLP work?"   # no model or GPU needed
+swlp doctor                                              # what can THIS machine run?
 python scripts/phase0_hardware_check.py                  # SSD bandwidth + hardware check
 ```
+
+`swlp doctor` detects your chip, RAM, and MLX availability, then prints the exact command to use for each supported model on your machine — start there if you're unsure which mode you need.
 
 ---
 
@@ -145,10 +187,14 @@ swlp --model mistral-7b --prompt "Explain transformers."
 
 `--model` accepts short aliases (`mistral-7b`, `qwen-14b`, `tiny-gpt2`) or any HuggingFace model ID.  
 Backend is auto-selected: `--quant` → MLX, `--shard-dir` → SWLP streaming, else HuggingFace.
+Steps 2–4 download their model checkpoint; the mock command remains the fastest installation check.
 
 ---
 
 ## Usage
+
+Run `swlp --help` for the complete CLI reference, `swlp chat --help` for interactive chat, and
+`swlp doctor` for a hardware-specific recommendation.
 
 ### Inference flags
 
@@ -166,6 +212,8 @@ swlp --model <name> --prompt "<text>" [options]
 ```
 
 ### Which backend to use
+
+Not sure? Run `swlp doctor` — it answers this table for your actual hardware. `swlp models` lists all aliases with sizes.
 
 | Your situation | Use |
 |----------------|-----|
@@ -186,8 +234,8 @@ swlp --shard-dir ./shards/mistral-7b --model mistral-7b --prompt "Hello"
 Or shard manually ahead of time:
 
 ```bash
-python scripts/shard_mistral.py    # → ./shards/mistral-7b  (~14 GB, ~5 min)
-python scripts/shard_qwen.py       # → ./shards/qwen2.5-14b (~26 GB, ~10 min)
+swlp download --model mistral-7b   # → ./shards/mistral-7b (~14 GB)
+swlp download --model qwen-14b     # → ./shards/qwen-14b   (~26 GB)
 ```
 
 Sharding streams weights block-by-block — the full model is never loaded into RAM.
@@ -234,7 +282,7 @@ NVMe SSD ──[background thread]──▶ CPU RAM window (W layers live)
 - At W=2: `2 × layer_size` RAM ever live. Mistral-7B (436 MB/layer) → **870 MB**.
 - Embeddings, layer norms, and the LM head are tiny — kept permanently on-device.
 
-**Why SWLP is 2× faster than AirLLM:** AirLLM serializes load → compute → discard with no overlap. SWLP keeps the SSD pipeline and the compute unit busy simultaneously.
+**Why SWLP beats AirLLM 2.11.0:** SWLP uses ~1.5× less RAM (immediate per-block eviction) and runs models with an explicit `head_dim` that crash AirLLM (e.g. Mistral-Small-24B). We pin AirLLM 2.11.0 and run its MLX class (`AirLLMLlamaMlx`); we do **not** attribute the throughput gap to prefetch, since that path was not profiled for I/O overlap (see paper §7.4).
 
 **Why batch throughput scales linearly:** The per-layer disk cost is the same whether 1 or 16 sequences pass through it. Load once, run N — sweep wall time stays flat (~0.28 s), aggregate tok/s scales with N.
 
@@ -277,6 +325,10 @@ Three ways, in order of precedence:
 | `SWLP_KV_WINDOW` | `4096` | Keep only last N KV positions (0 = unbounded) |
 | `SWLP_SPEC_MAX_DRAFT` | `8` | Speculative: max draft tokens per sweep |
 | `SWLP_RESIDENCY` | `auto` | `auto` · `off` · `<integer>` layer count |
+| `SWLP_SHARD_VOLUMES` | — | Comma-separated extra shard dirs; layers stripe across SSDs |
+| `SWLP_PREFILL_CHUNK` | `0` | Prompt tokens per prefill sweep slice (0 = single sweep) |
+| `SWLP_EXPERT_CACHE_MB` | `0` | MoE expert-cache RAM budget (0 = auto) |
+| `SWLP_EXPERT_PREFETCH` | `predictive` | MoE expert prefetch: `off` · `router` · `predictive` |
 | `SWLP_PROFILE` | `1` | Collect detailed per-layer timings |
 
 ### Config profiles
@@ -304,15 +356,24 @@ Any HuggingFace Llama / Mistral family model works with SWLP streaming. Tested:
 | `Qwen/Qwen2.5-14B-Instruct` | `qwen-14b` | 26 GB | ✅ | ✅ |
 | `mistralai/Mistral-Small-24B-Instruct-2501` | — | 44 GB | ✅ | — |
 | `Qwen/Qwen2.5-32B-Instruct` | — | ~60 GB | ✅ | — |
+| `Qwen/Qwen3-30B-A3B-Instruct-2507` | `qwen3-30b-a3b` | 61 GB | ✅ MoE | — |
+| `mistralai/Mixtral-8x7B-Instruct-v0.1` | `mixtral-8x7b` | 93 GB | ✅ MoE | — |
 | `HuggingFaceTB/SmolLM2-360M-Instruct` | — | 720 MB | ✅ | — |
 | `openai-community/gpt2` | `tiny-gpt2` | 548 MB | ✅ | — |
+
+**MoE models (Phase 25)** stream *selectively*: each sweep reads the dense
+parts plus only the routed experts the tokens activate, so per-token bytes
+scale with active parameters (Qwen3-30B-A3B: 3.4B of 30B) while disk holds the
+full model. Quality is exact — routing is part of the forward pass. Tune the
+expert cache with `SWLP_EXPERT_CACHE_MB`; see `swlp doctor` for guidance and
+`scripts/research/moe_sweep.py` for budget sweeps.
 
 ---
 
 ## Development
 
 ```bash
-pytest                             # all 154 tests — no GPU or model download needed
+pytest                             # full suite — no GPU or model download needed
 pytest tests/test_simulator.py    # single file
 pytest -k test_plan_residency     # single test by name
 ruff check src/                   # lint
@@ -326,7 +387,7 @@ All tests use `MockRunner` or pure-math functions. The full suite completes in s
 
 ## Limitations
 
-- **FP16 throughput ceiling:** `tok/s ≤ SSD_bandwidth / model_bytes_per_token`. On M5 (6.93 GB/s) with Mistral-7B this caps at ~0.50 tok/s. Use `--backend mlx` when you need speed and the model fits.
+- **FP16 throughput ceiling:** `tok/s ≤ SSD_bandwidth / model_bytes_per_token`. On M5 (6.93 GB/s) with Mistral-7B this caps at **0.496 tok/s** (measured cold throughput ~0.17 tok/s). Use `--backend mlx` when you need speed and the model fits.
 - **Streaming is a feasibility tool, not a speed tool.** If your model fits RAM, `--backend hf` or `--backend mlx` will be faster. SWLP streaming wins only when those options OOM.
 - **MLX is Apple Silicon only.** `--backend mlx` requires macOS + M-series chip.
 - **Speculative speedup is workload-dependent.** ~1× on novel text, up to 3.3× on repetitive output.
@@ -353,9 +414,26 @@ Developed and benchmarked on **macOS M5 (16 GB)**. If you run it on Linux/NVIDIA
 | Doc | Description |
 |-----|-------------|
 | [`docs/results.md`](docs/results.md) | Full benchmark tables across all phases |
+| [`docs/benchmark_methodology.md`](docs/benchmark_methodology.md) | How benchmarks are run: cold-vs-warm cache protocol, provenance, fair head-to-head rules |
 | [`docs/swlp_vs_airllm.md`](docs/swlp_vs_airllm.md) | Detailed SWLP vs AirLLM comparison |
 | [`docs/hardware_baseline.md`](docs/hardware_baseline.md) | M5 measured SSD / MPS / RAM numbers |
+| [`docs/architecture.md`](docs/architecture.md) | System architecture and pipeline analysis |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phase history and open research work |
 | [`docs/phase5_design_decisions.md`](docs/phase5_design_decisions.md) | Speculative decoding design rationale |
+| [`CHANGELOG.md`](CHANGELOG.md) | Release history and notable changes |
+
+---
+
+## Support and Contributing
+
+- For setup questions, bugs, or feature requests, [search or open an issue](https://github.com/Rishav-Upadhaya/SWLP/issues).
+- For code, documentation, or hardware-benchmark contributions, follow the [contribution guide](CONTRIBUTING.md).
+
+---
+
+## Citation
+
+If SWLP contributes to your research, please cite it using [CITATION.cff](CITATION.cff).
 
 ---
 

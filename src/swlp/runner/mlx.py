@@ -14,11 +14,17 @@ feasibility tool, ``MlxRunner`` is the fast tool.
 Quality dial (``runtime.mlx_quant``): ``bf16`` (lossless) | ``int8``
 (near-lossless, default) | ``int4`` (fast tier, mild quality cost).
 
-M5 optimisations wired through to mlx-lm kwargs:
-- ``max_kv_size``: sliding KV window via RotatingKVCache (from ``kv_window``).
-- ``kv_bits``:     native MLX KV-cache quantisation  (from ``kv_quant``).
-- ``draft_model``: speculative decoding — 2-4× throughput on suitable prompts
-                   (from ``mlx_draft_model``; ignored when kv_window is set).
+Apple Silicon tuning is centralised in ``runner/mlx_tune.py`` and wired here:
+
+- **wired-memory ceiling** — raised at load time so a model that macOS would
+  otherwise push into swap stays resident. Biggest single win on 16 GB.
+- **KV quantization** (``mlx_kv_bits``) — 4-bit KV is measured *faster* than
+  fp16 on unified memory, because decode is bandwidth-bound.
+- **prompt cache** — the shared prefix of a chat is prefilled once, not once
+  per turn. Exact reuse, no quality cost.
+- **speculative decoding** (``mlx_draft_model``) — 1.9-2.1x measured on
+  M4/M5 with a same-family draft model.
+- **prefill chunking** (``mlx_prefill_step_size``) — bounds TTFT memory.
 """
 from __future__ import annotations
 
@@ -31,6 +37,7 @@ from typing import Any
 
 from ..config import AppConfig
 from ..metrics import RunMetrics, RunResult
+from .mlx_tune import apply_memory_tuning, generation_kwargs
 
 LOGGER = logging.getLogger(__name__)
 
@@ -53,6 +60,12 @@ class MlxRunner:
         self._mlx_model = None
         self._mlx_draft_model = None
         self.tokenizer = None  # exposed so run_chat() can build the chat template
+        # Prompt cache reused across turns in a chat session, plus the token
+        # ids it currently holds so we only reuse it on an exact prefix match.
+        self._prompt_cache = None
+        self._prompt_cache_tokens: list[int] = []
+        self.tuning = None  # TuningReport, set on first load
+        self.degradations: list[str] = []
 
     def _resolve_model_path(self) -> str:
         """Return a path/repo for ``mlx_lm.load``.
@@ -88,7 +101,15 @@ class MlxRunner:
         """Load and cache the MLX model and tokenizer; no-op if already loaded."""
         if self._mlx_model is not None:
             return
+        import psutil
         from mlx_lm import load
+
+        # Raise the wired-memory ceiling BEFORE the weights land, so a model
+        # that would otherwise be pushed into swap is admitted to RAM.
+        self.tuning = apply_memory_tuning(
+            self.config.runtime.mlx_wired_limit,
+            psutil.virtual_memory().total / (1024 ** 3),
+        )
 
         model_path = self._resolve_model_path()
         LOGGER.info("mlx_loading", extra={"model_path": model_path, "quant": self.mlx_quant})
@@ -116,23 +137,46 @@ class MlxRunner:
     def _gen_kwargs(self) -> dict[str, Any]:
         """Build mlx-lm generation kwargs from the active config.
 
-        Maps SWLP runtime settings to the kwargs accepted by
-        ``mlx_lm.stream_generate`` / ``generate_step``:
-
-        - ``kv_window > 0``  →  ``max_kv_size`` (RotatingKVCache sliding window)
-        - ``kv_quant int4``  →  ``kv_bits=4``   (native MLX KV quantisation)
-
-        Note: mlx-lm drops ``max_kv_size`` silently when ``draft_model`` is
-        provided, so both can always be passed — speculative decoding takes
-        precedence over the KV window.
+        ``mlx_kv_bits`` is the explicit MLX control; the shared ``kv_quant
+        = int4`` setting maps onto it too, so a config written for the
+        streaming backend does the sane thing here.
         """
-        kwargs: dict[str, Any] = {}
-        kv_window = self.config.runtime.kv_window
-        if kv_window > 0:
-            kwargs["max_kv_size"] = kv_window
-        if self.config.runtime.kv_quant == "int4":
-            kwargs["kv_bits"] = 4
-        return kwargs
+        rt = self.config.runtime
+        kv_bits = int(rt.mlx_kv_bits)
+        if kv_bits == 0 and rt.kv_quant == "int4":
+            kv_bits = 4
+        return generation_kwargs(
+            kv_bits=kv_bits,
+            kv_group_size=int(rt.mlx_kv_group_size),
+            quantized_kv_start=int(rt.mlx_quantized_kv_start),
+            max_kv_size=int(rt.kv_window),
+            prefill_step_size=int(rt.mlx_prefill_step_size),
+            num_draft_tokens=int(rt.mlx_num_draft_tokens),
+            has_draft_model=self._mlx_draft_model is not None,
+        )
+
+    def _resolve_prompt_cache(self, prompt: str) -> Any:
+        """Return a prompt cache to pass to mlx-lm, reusing it across turns.
+
+        mlx-lm mutates the cache in place as it generates, so after turn N it
+        holds the KV for "turn N prompt + turn N answer". Turn N+1 re-sends
+        exactly that as its prefix, which is why an exact prefix match is both
+        common and safe. On a mismatch we start fresh rather than guess.
+        """
+        if not self.config.runtime.mlx_prompt_cache:
+            return None
+        from mlx_lm.models.cache import make_prompt_cache
+
+        ids = self.tokenizer.encode(prompt)
+        cached = self._prompt_cache_tokens
+        if self._prompt_cache is not None and ids[: len(cached)] == cached and cached:
+            LOGGER.info("mlx_prompt_cache_hit", extra={"reused_tokens": len(cached)})
+            self._prompt_cache_tokens = ids
+            return self._prompt_cache
+
+        self._prompt_cache = make_prompt_cache(self._mlx_model)
+        self._prompt_cache_tokens = ids
+        return self._prompt_cache
 
     def stream_tokens(self, prompt: str, max_tokens: int = 512) -> Iterator[str]:
         """Yield text fragments from ``mlx_lm.stream_generate`` as they arrive."""
@@ -140,6 +184,9 @@ class MlxRunner:
 
         self._ensure_loaded()
         kwargs = self._gen_kwargs()
+        cache = self._resolve_prompt_cache(prompt)
+        if cache is not None:
+            kwargs["prompt_cache"] = cache
         for resp in stream_generate(
             self._mlx_model,
             self.tokenizer,
@@ -171,6 +218,9 @@ class MlxRunner:
         gen_tps: float | None = None
 
         kwargs = self._gen_kwargs()
+        cache = self._resolve_prompt_cache(prompt)
+        if cache is not None:
+            kwargs["prompt_cache"] = cache
         gen_start = time.perf_counter()
         last = gen_start
         for resp in stream_generate(

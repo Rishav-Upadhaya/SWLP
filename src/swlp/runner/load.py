@@ -121,7 +121,85 @@ def load_from_shards(runner: Any, shard_dir: Path) -> tuple[Any, Any]:
     _materialize_embeddings(model, embed_state, manifest.model_type, runner.device)
     model.lm_head.to_empty(device=runner.device)
     model.lm_head.load_state_dict(lm_head_state, strict=False, assign=True)
+    _wire_expert_streaming(runner, model, manifest, shard_dir)
     return model, tokenizer
+
+
+def _wire_expert_streaming(runner: Any, model: Any, manifest: Any, shard_dir: Path) -> None:
+    """Swap fused Experts modules for slot-cached ones when the shard dir has
+    expert banks (Phase 25). Dense models are untouched.
+
+    The swapped modules keep the reference forward math (bit-exact output);
+    the global ``ExpertScheduler`` lands on ``runner._expert_sched`` for the
+    per-layer prefetch hook and teardown.
+    """
+    from ..model.expert_bank import EXPERT_INDEX_FILE, ExpertIndex
+    from .expert_scheduler import ExpertScheduler
+    from .experts import SwlpCachedExperts
+
+    if manifest.num_experts <= 0:
+        return
+    index_path = shard_dir / EXPERT_INDEX_FILE
+    if index_path.is_file():
+        index = ExpertIndex.load(index_path)
+    else:
+        # v1 shard dir (experts inline in the layer files): index in place.
+        # Honest trade-off: the dense stream still reads the whole layer file
+        # (expert bytes included) and the scheduler range-reads experts again
+        # — a double read of expert bytes, kept for v1 compatibility only.
+        # Re-shard to get the v2 split.
+        index = ExpertIndex.build(shard_dir, manifest.num_layers)
+        if index:
+            index.save(index_path)
+    if not index:
+        return
+
+    budget_mb = int(runner.config.runtime.swlp_expert_cache_mb)
+    if budget_mb <= 0:
+        import psutil
+
+        budget_mb = int(min(4 * 1024, 0.25 * psutil.virtual_memory().available / 1024**2))
+    sched = ExpertScheduler(
+        index, shard_dir, runner.device, runner.dtype,
+        budget_bytes=budget_mb * 1024 * 1024,
+        mode=str(runner.config.runtime.swlp_expert_prefetch),
+    )
+    act_fn = str(getattr(model.config, "hidden_act", "silu"))
+    blocks = model.model.layers if hasattr(model, "model") else []
+    wired = 0
+    for layer, block in enumerate(blocks):
+        parent_name, parent = _find_experts_parent(block)
+        if parent is None:
+            continue
+        li = index.layers.get(layer)
+        if li is None:
+            LOGGER.warning("expert_bank_layer_missing", extra={"layer": layer})
+            continue
+        # Construct at the FINAL slot capacity directly — an interim
+        # full-bank allocation (~all expert weights on device) would OOM the
+        # memory-constrained machines this engine targets.
+        module = SwlpCachedExperts(
+            layer, li.num_experts, li.hidden, li.intermediate,
+            runner.dtype, runner.device, act_fn, sched, slots=sched.slot_cap(layer),
+        )
+        sched.register(layer, module)
+        parent.experts = module
+        wired += 1
+    runner._expert_sched = sched
+    LOGGER.info(
+        "expert_streaming_wired",
+        extra={"layers": wired, "budget_mb": budget_mb,
+               "mode": str(runner.config.runtime.swlp_expert_prefetch)},
+    )
+
+
+def _find_experts_parent(block: Any) -> tuple[str, Any]:
+    """Name and module of the child holding a fused ``experts`` container."""
+    for name, child in block.named_children():
+        experts = getattr(child, "experts", None)
+        if experts is not None and experts.__class__.__name__.endswith("Experts"):
+            return name, child
+    return "", None
 
 
 def _materialize_embeddings(
@@ -135,7 +213,19 @@ def _materialize_embeddings(
             t.wpe.to_empty(device=device)
             t.wpe.load_state_dict(embed_state["wpe"], assign=True)
         t.drop.to_empty(device=device)
-        t.ln_f.to_empty(device=device)
+        if "ln_f" in embed_state:
+            t.ln_f.to_empty(device=device)
+            t.ln_f.load_state_dict(embed_state["ln_f"], assign=True)
+        else:
+            # Legacy shard dirs (pre-ln_f persistence): to_empty leaves the
+            # final norm in uninitialized memory — zeroed on a fresh process,
+            # stale recycled pages afterwards. The only correct fix is a
+            # re-shard; warn loudly rather than fail silently.
+            t.ln_f.to_empty(device=device)
+            LOGGER.warning(
+                "embed_state_missing_ln_f",
+                extra={"hint": "re-shard this model to persist ln_f in embed.pt"},
+            )
         return
     if hasattr(model, "model") and "embed_tokens" in embed_state:
         inner = model.model

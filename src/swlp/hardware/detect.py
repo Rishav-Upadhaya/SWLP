@@ -1,19 +1,69 @@
 """Hardware detection for SWLP cross-platform support."""
 from __future__ import annotations
 
+import json
+import os
 import platform
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
+
+# Platform-default SSD bandwidths (GB/s) used only until a real measurement
+# is available — see ``save_measured_bandwidth`` / ``phase0_hardware_check``.
+_APPLE_SSD_DEFAULT_GBPS = 6.5
+_OTHER_SSD_DEFAULT_GBPS = 3.5
+
+
+def bandwidth_cache_path() -> Path:
+    """Location of the measured-hardware cache (overridable via env)."""
+    override = os.getenv("SWLP_HW_CACHE")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".cache" / "swlp" / "hardware.json"
+
+
+def save_measured_bandwidth(gbps: float) -> None:
+    """Persist a measured SSD read bandwidth for future ``detect_hardware`` calls.
+
+    Written by ``scripts/phase0_hardware_check.py``; replaces the hardcoded
+    platform defaults in the Hardware Probe so the residency planner reasons
+    over real bandwidth.
+    """
+    path = bandwidth_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"ssd_read_gbps": float(gbps)}
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+
+
+def _measured_ssd_bandwidth() -> float | None:
+    """Best-known SSD read bandwidth: env override → measured cache → None."""
+    env = os.getenv("SWLP_SSD_BW_GBPS")
+    if env:
+        try:
+            value = float(env)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    try:
+        with open(bandwidth_cache_path(), encoding="utf-8") as fh:
+            value = float(json.load(fh).get("ssd_read_gbps", 0.0))
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return None
 
 
 @dataclass(slots=True)
 class HardwareInfo:
-    device_type: str        # "cuda" | "mps" | "cpu"
+    device_type: str        # "mps" | "cpu"
     unified_memory: bool    # True on Apple Silicon (no PCIe bus)
     memory_gb: float        # total system RAM (unified on Apple)
     ssd_bandwidth_gbps: float
-    preferred_backend: str  # "cuda" | "mlx" | "torch"
+    preferred_backend: str  # "mlx" | "torch"
     chip_name: str
 
 
@@ -72,27 +122,16 @@ def detect_hardware() -> HardwareInfo:
             device_type="mps" if mps_ok else "cpu",
             unified_memory=True,
             memory_gb=mem,
-            ssd_bandwidth_gbps=6.5,  # typical M-series NVMe
+            ssd_bandwidth_gbps=_measured_ssd_bandwidth() or _APPLE_SSD_DEFAULT_GBPS,
             preferred_backend=backend,
             chip_name=chip,
-        )
-
-    if torch.cuda.is_available():
-        props = torch.cuda.get_device_properties(0)
-        return HardwareInfo(
-            device_type="cuda",
-            unified_memory=False,
-            memory_gb=_system_memory_gb(),
-            ssd_bandwidth_gbps=3.5,
-            preferred_backend="cuda",
-            chip_name=props.name,
         )
 
     return HardwareInfo(
         device_type="cpu",
         unified_memory=False,
         memory_gb=_system_memory_gb(),
-        ssd_bandwidth_gbps=3.5,
+        ssd_bandwidth_gbps=_measured_ssd_bandwidth() or _OTHER_SSD_DEFAULT_GBPS,
         preferred_backend="torch",
         chip_name=platform.processor() or "Unknown CPU",
     )
@@ -104,7 +143,7 @@ def window_size_recommendation(hw: HardwareInfo, layer_weight_mb: float) -> int:
     Transfer time = layer_weight_mb / (bandwidth_mb_per_s).
     Pick window so transfer is mostly hidden by compute.
     """
-    bandwidth_mb_per_s = hw.ssd_bandwidth_gbps * 1024 / 8
+    bandwidth_mb_per_s = hw.ssd_bandwidth_gbps * 1024
     if bandwidth_mb_per_s <= 0:
         return 2
     transfer_ms = (layer_weight_mb / bandwidth_mb_per_s) * 1000

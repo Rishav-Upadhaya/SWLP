@@ -57,11 +57,10 @@ def print_simulation_report(path: Path) -> None:
         window = result.get("window_size", "n/a")
         print(
             "W={window} | per-token={per_token} | throughput={throughput} | "
-            "VRAM={vram} | RAM={ram} | bottleneck={bottleneck} | rec={rec}".format(
+            "RAM={ram} | bottleneck={bottleneck} | rec={rec}".format(
                 window=window,
                 per_token=_format_seconds(result.get("per_token_seconds")),
                 throughput=_format_rate(result.get("throughput_tokens_per_second")),
-                vram=_format_mb(result.get("vram_peak_mb")),
                 ram=_format_mb(result.get("ram_peak_mb")),
                 bottleneck=result.get("bottleneck", "n/a"),
                 rec=result.get("recommendation", "n/a"),

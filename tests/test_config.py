@@ -50,6 +50,7 @@ model_id = "custom/model"
     monkeypatch.setenv("SWLP_KV_BUDGET_MB", "256")
     monkeypatch.setenv("SWLP_KV_COMPRESSION", "true")
     monkeypatch.setenv("SWLP_KV_TIERING", "true")
+    monkeypatch.setenv("SWLP_DIRECT_IO", "off")
 
     config = load_config(config_file)
 
@@ -61,3 +62,4 @@ model_id = "custom/model"
     assert config.runtime.kv_memory_budget_mb == 256
     assert config.runtime.kv_compression is True
     assert config.runtime.kv_tiering is True
+    assert config.runtime.swlp_direct_io == "off"

@@ -11,7 +11,7 @@ def test_simulation_outputs_basic_metrics():
         context_tokens=64,
         generate_tokens=8,
         kv_bytes_per_token=1024,
-        vram_capacity_mb=1024,
+        device_memory_mb=1024,
         ram_capacity_mb=2048,
         pcie_bandwidth_gbps=16.0,
         ram_bandwidth_gbps=50.0,
@@ -37,7 +37,7 @@ def test_memory_overflow_marks_not_viable():
         context_tokens=128,
         generate_tokens=16,
         kv_bytes_per_token=1024,
-        vram_capacity_mb=256,
+        device_memory_mb=256,
         ram_capacity_mb=2048,
         pcie_bandwidth_gbps=16.0,
         ram_bandwidth_gbps=50.0,
@@ -47,5 +47,5 @@ def test_memory_overflow_marks_not_viable():
     )
 
     result = simulate_scenario(scenario)[0]
-    assert result.fits_vram is False
+    assert result.fits_device is False
     assert "not viable" in result.recommendation

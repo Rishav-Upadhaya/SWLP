@@ -1,11 +1,17 @@
-"""Speculative-decoding runner for SWLP (Phase 5).
+"""Speculative-decoding runner for SWLP (Phase 5 + Phase 21).
 
 ``SpeculativeRunner`` is a ``SWLPRunner`` that replaces the
-one-token-per-disk-sweep decode loop with **prompt-lookup speculative
-decoding**: an n-gram drafter proposes up to K continuation tokens, and the
-streamed target model verifies all K in a single 32-layer disk sweep. Accepted
-tokens are amortised over that one sweep, so throughput rises with the
-acceptance rate.
+one-token-per-disk-sweep decode loop with **speculative decoding**: a drafter
+proposes up to K continuation tokens, and the streamed target model verifies
+all K in a single 32-layer disk sweep. Accepted tokens are amortised over that
+one sweep, so throughput rises with the acceptance rate.
+
+Two drafters, selected by config:
+
+- ``swlp_draft_model`` set (Phase 21) — ``DraftModelDrafter``: a small resident
+  same-tokenizer model drafts on every step; works on novel text.
+- otherwise (Phase 5) — ``NgramDrafter``: prompt-lookup n-gram matching; zero
+  extra RAM but only fires on repetitive / long-context output.
 
 Output is **bit-identical to greedy SWLP** — every proposed token is greedily
 verified by the target model; speculation changes throughput only, never
@@ -18,11 +24,14 @@ exclusive with speculative decoding — see ``docs/phase5_design_decisions.md``.
 from __future__ import annotations
 
 import logging
+import time
 
 import torch
 
+from ..config import AppConfig
 from ..core.speculative import NgramDrafter, SpeculativeConfig, verify_greedy
 from .arch import ArchAdapter
+from .draft import DraftModelDrafter, ensure_same_tokenizer, load_draft_model
 from .swlp import SWLPRunner
 
 LOGGER = logging.getLogger(__name__)
@@ -30,6 +39,56 @@ LOGGER = logging.getLogger(__name__)
 
 class SpeculativeRunner(SWLPRunner):
     backend = "speculative"
+
+    def __init__(self, config: AppConfig) -> None:
+        super().__init__(config)
+        self._draft_model = None
+
+    def load(self) -> float:
+        """Load the target, then the resident draft model (when configured).
+
+        The drafter is loaded here so its cost lands in load time, not in the
+        generation timing — keeps tok/s comparable with the other backends.
+        """
+        elapsed = super().load()
+        draft_id = self.config.runtime.swlp_draft_model.strip()
+        if draft_id and self._draft_model is None:
+            started = time.perf_counter()
+            model, draft_tokenizer = load_draft_model(
+                draft_id,
+                self.config.cache.cache_dir,
+                self.dtype,
+                self.device,
+                self.config.model.trust_remote_code,
+            )
+            ensure_same_tokenizer(self.tokenizer, draft_tokenizer)
+            self._draft_model = model
+            elapsed += time.perf_counter() - started
+        return elapsed
+
+    def _build_drafter(self) -> NgramDrafter | DraftModelDrafter:
+        """Pick the drafter: resident draft model when configured, else n-gram.
+
+        The draft model is loaded once and kept resident across generations
+        (chat turns reuse it); the ``DraftModelDrafter`` wrapper itself is
+        per-generation state (its KV cache self-heals via common-prefix crop,
+        so a fresh wrapper just costs one cheap drafter prefill).
+        """
+        spec_cfg = self._spec_config()
+        draft_id = self.config.runtime.swlp_draft_model.strip()
+        if not draft_id:
+            return NgramDrafter(spec_cfg)
+        if self._draft_model is None:
+            model, draft_tokenizer = load_draft_model(
+                draft_id,
+                self.config.cache.cache_dir,
+                self.dtype,
+                self.device,
+                self.config.model.trust_remote_code,
+            )
+            ensure_same_tokenizer(self.tokenizer, draft_tokenizer)
+            self._draft_model = model
+        return DraftModelDrafter(self._draft_model, self.device, spec_cfg.max_draft)
 
     def _make_past_state(self, adapter: ArchAdapter, num_layers: int):
         """Force a plain, rollback-capable KV cache.
@@ -143,7 +202,7 @@ class SpeculativeRunner(SWLPRunner):
         """Speculative decode loop — one disk sweep verifies up to K tokens."""
         assert self.model is not None
         spec_cfg = self._spec_config()
-        drafter = NgramDrafter(spec_cfg)
+        drafter = self._build_drafter()
         max_new = int(self.config.generation.max_new_tokens)
         eos = (
             int(self.tokenizer.eos_token_id)
@@ -171,6 +230,8 @@ class SpeculativeRunner(SWLPRunner):
                 steps += 1
                 total_draft += len(draft)
                 total_accepted += n_accepted
+                if isinstance(drafter, DraftModelDrafter):
+                    drafter.observe(len(draft), n_accepted)
 
                 stop = False
                 if eos is not None and eos in new_tokens:
@@ -194,6 +255,8 @@ class SpeculativeRunner(SWLPRunner):
                 "draft_tokens_accepted": total_accepted,
                 "acceptance_rate": round(accept_rate, 4),
                 "tokens_per_sweep": round(tokens_per_sweep, 3),
+                "drafter": type(drafter).__name__,
+                "draft_model": self.config.runtime.swlp_draft_model or None,
                 "ngram_size": spec_cfg.ngram_size,
                 "max_draft": spec_cfg.max_draft,
             },

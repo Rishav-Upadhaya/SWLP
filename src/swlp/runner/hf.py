@@ -23,12 +23,26 @@ class HuggingFaceRunner:
         self.tokenizer = None
         self.device = self._resolve_device()
         self.dtype = self._resolve_dtype()
+        # Every hot-path failure that was caught rather than raised, in order.
+        # Surfaced on RunMetrics so a degraded run is never mistaken for a
+        # clean measurement.  SWLP_STRICT=1 turns each one back into a raise.
+        self.degradations: list[str] = []
+
+    def degrade(self, reason: str, exc: BaseException | None = None) -> None:
+        """Record a survivable hot-path failure, or re-raise it in strict mode.
+
+        The default is to keep going — a slower correct answer beats a crash.
+        But a run that degraded is not a clean benchmark, so the reason lands
+        in ``RunMetrics.degradations`` where the report can show it.
+        """
+        LOGGER.warning("swlp_degraded", extra={"reason": reason})
+        self.degradations.append(reason)
+        if self.config.runtime.swlp_strict and exc is not None:
+            raise exc
 
     def _resolve_device(self) -> torch.device:
         configured = self.config.runtime.device.lower()
         if configured == "auto":
-            if torch.cuda.is_available():
-                return torch.device("cuda")
             if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
                 return torch.device("mps")
             return torch.device("cpu")
@@ -37,9 +51,10 @@ class HuggingFaceRunner:
     def _resolve_dtype(self) -> torch.dtype:
         configured = self.config.runtime.dtype.lower()
         if configured == "auto":
-            if self.device.type == "cuda":
-                return torch.float16
-            return torch.float32
+            # MPS: float16 halves the bandwidth per weight, and bandwidth is the
+            # binding constraint on unified memory. CPU keeps float32 (no fast
+            # half-precision path).
+            return torch.float16 if self.device.type == "mps" else torch.float32
         return getattr(torch, configured)
 
     def load(self) -> float:
@@ -131,9 +146,7 @@ class HuggingFaceRunner:
         return logits
 
     def _sync_device(self) -> None:
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
-        elif self.device.type == "mps" and hasattr(torch, "mps"):
+        if self.device.type == "mps" and hasattr(torch, "mps"):
             torch.mps.synchronize()
 
     def _generate_with_timings(
@@ -216,7 +229,14 @@ class HuggingFaceRunner:
                     past_key_values=past_key_values,
                     use_cache=True,
                 )
-                next_token = self._select_next_token(outputs.logits[:, -1, :])
+                # Parity with run(): the streaming path must see the same
+                # repetition-penalised logits the one-shot path does.
+                logits = self._apply_repetition_penalty(
+                    outputs.logits[:, -1, :],
+                    generated,
+                    self.config.generation.repetition_penalty,
+                )
+                next_token = self._select_next_token(logits)
                 token_id = int(next_token.item())
                 token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
                 if token_text:
@@ -264,11 +284,6 @@ class HuggingFaceRunner:
         )
 
         ttft = per_token_latency[0] if per_token_latency else None
-        vram_peak_bytes = (
-            int(torch.cuda.max_memory_allocated(self.device))
-            if profile and self.device.type == "cuda" and torch.cuda.is_available()
-            else None
-        )
 
         metrics = RunMetrics(
             model_id=self.config.model.model_id,
@@ -287,7 +302,6 @@ class HuggingFaceRunner:
                 generated_tokens / generate_seconds if generate_seconds > 0 else None
             ),
             generated_tokens=generated_tokens,
-            vram_peak_bytes=vram_peak_bytes,
             ram_peak_bytes=peak_rss_bytes if profile else None,
         )
         return RunResult(prompt=prompt, completion=completion, metrics=metrics)

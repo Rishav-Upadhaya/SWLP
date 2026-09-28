@@ -90,9 +90,12 @@ def test_draft_model_set_via_config():
 # ── _gen_kwargs (max_kv_size / kv_bits) ──────────────────────────────────────
 
 
-def test_gen_kwargs_empty_by_default():
+def test_gen_kwargs_default_is_prefill_chunking_only():
+    """Defaults must be quality-neutral: a prefill chunk size and nothing else.
+    KV quantization and the KV window both change behaviour, so neither is on
+    unless asked for."""
     runner = MlxRunner(_mlx_config())
-    assert runner._gen_kwargs() == {}
+    assert runner._gen_kwargs() == {"prefill_step_size": 2048}
 
 
 def test_gen_kwargs_max_kv_size_from_kv_window():
@@ -131,3 +134,61 @@ def test_gen_kwargs_combined():
     kwargs = runner._gen_kwargs()
     assert kwargs["max_kv_size"] == 256
     assert kwargs["kv_bits"] == 4
+
+
+# ── Apple Silicon tuning (runner/mlx_tune.py) ────────────────────────────────
+
+def test_gen_kwargs_mlx_kv_bits_emits_group_and_start():
+    """kv_bits never travels alone: group size and the exact-prefix start
+    must accompany it or mlx-lm silently uses its own defaults."""
+    config = _mlx_config()
+    config.runtime.mlx_kv_bits = 4
+    kwargs = MlxRunner(config)._gen_kwargs()
+    assert kwargs["kv_bits"] == 4
+    assert kwargs["kv_group_size"] == 64
+    assert kwargs["quantized_kv_start"] == 512
+
+
+def test_gen_kwargs_invalid_kv_bits_is_ignored_not_passed_through():
+    config = _mlx_config()
+    config.runtime.mlx_kv_bits = 3          # MLX supports 4 and 8 only
+    assert "kv_bits" not in MlxRunner(config)._gen_kwargs()
+
+
+def test_gen_kwargs_draft_tokens_only_with_a_draft_model():
+    """num_draft_tokens without a draft model is meaningless — mlx-lm would
+    ignore it, and emitting it hides a misconfiguration."""
+    config = _mlx_config()
+    config.runtime.mlx_num_draft_tokens = 6
+    runner = MlxRunner(config)
+    assert "num_draft_tokens" not in runner._gen_kwargs()
+    runner._mlx_draft_model = object()      # pretend a draft model loaded
+    assert runner._gen_kwargs()["num_draft_tokens"] == 6
+
+
+def test_recommended_wired_limit_leaves_the_os_room():
+    from swlp.runner.mlx_tune import recommended_wired_limit_mb
+
+    # 16 GB machine: 4 GB reserved for macOS, so ~12 GB wired.
+    assert recommended_wired_limit_mb(16.0) == 12 * 1024
+    # Never exceed the safety fraction, however big the machine.
+    assert recommended_wired_limit_mb(8.0) <= int(8.0 * 0.92 * 1024)
+    # Tiny machines still get a positive, non-absurd number.
+    assert recommended_wired_limit_mb(4.0) > 0
+
+
+def test_apply_memory_tuning_off_is_a_no_op():
+    from swlp.runner.mlx_tune import apply_memory_tuning
+
+    report = apply_memory_tuning("off", 16.0)
+    assert report.wired_limit_mb is None
+    assert "untouched" in report.notes[0]
+
+
+def test_apply_memory_tuning_rejects_garbage_without_raising():
+    """A bad value must not take the process down — it is an optimisation."""
+    from swlp.runner.mlx_tune import apply_memory_tuning
+
+    report = apply_memory_tuning("not-a-number", 16.0)
+    assert report.wired_limit_mb is None
+    assert any("invalid" in n for n in report.notes)

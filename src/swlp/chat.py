@@ -14,46 +14,11 @@ Slash commands (at the ``You:`` prompt):
 """
 from __future__ import annotations
 
-import sys
 import time
 from dataclasses import dataclass, field
 
+from . import tui
 from .config import AppConfig
-
-# ── ANSI colour helpers ───────────────────────────────────────────────────────
-
-_COLOUR_SUPPORT = sys.stdout.isatty()
-
-
-def _c(code: str, text: str) -> str:
-    if not _COLOUR_SUPPORT:
-        return text
-    return f"\033[{code}m{text}\033[0m"
-
-
-def _bold(t: str) -> str:
-    return _c("1", t)
-
-
-def _dim(t: str) -> str:
-    return _c("2", t)
-
-
-def _green(t: str) -> str:
-    return _c("32", t)
-
-
-def _blue(t: str) -> str:
-    return _c("34", t)
-
-
-def _cyan(t: str) -> str:
-    return _c("36", t)
-
-
-def _yellow(t: str) -> str:
-    return _c("33", t)
-
 
 # ── Chat session ──────────────────────────────────────────────────────────────
 
@@ -104,37 +69,92 @@ def format_chat_prompt(session: ChatSession, tokenizer, user_input: str) -> str:
 
 # ── Terminal helpers ──────────────────────────────────────────────────────────
 
-def _banner(model_id: str, backend: str, quant: str | None) -> None:
-    quant_str = f"/{quant}" if quant and backend == "mlx" else ""
-    title = f" SWLP Chat  ·  {model_id}  ·  {backend}{quant_str} "
-    hint = " /quit  exit   /clear  reset   /help  commands "
-    width = max(len(title), len(hint)) + 2
-    bar = "─" * width
-    print(_dim(f"╭{bar}╮"))
-    print(_dim("│") + _bold(_cyan(title.center(width))) + _dim("│"))
-    print(_dim("│") + _dim(hint.center(width)) + _dim("│"))
-    print(_dim(f"╰{bar}╯"))
+def _banner(model_id: str, backend: str, quant: str | None, extra: list[str]) -> None:
+    """Session header: what is loaded, and how to drive it."""
+    label = f"{backend}/{quant}" if quant and backend == "mlx" else backend
+    lines = [
+        tui.kv("model", tui.bold(model_id), 9),
+        tui.kv("backend", label, 9),
+    ]
+    lines += [tui.kv(k, v, 9) for k, v in (e.split("=", 1) for e in extra if "=" in e)]
+    lines.append("")
+    lines.append(
+        tui.dim("/quit  ") + tui.dim("exit") + tui.dim("     /clear  ")
+        + tui.dim("reset") + tui.dim("     /help  ") + tui.dim("commands")
+    )
+    print()
+    print(tui.box(lines, title="SWLP chat"))
     print()
 
 
 def _user_prompt() -> str:
-    """Print the 'You' label and return stripped user input."""
+    """Print the 'you' label and return stripped user input."""
     try:
-        raw = input(_bold(_blue(" You  ")))
+        raw = input(tui.bold(tui.blue("you  ")) + tui.dim("› "))
     except EOFError:
         return "/quit"
     return raw.strip()
 
 
 def _print_assistant_label() -> None:
-    print(_bold(_green("\n Assistant  ")), end="", flush=True)
+    print(tui.bold(tui.green("\nswlp ")) + tui.dim("›"))
 
 
 def _print_status(tps: float, elapsed: float, n_tokens: int) -> None:
-    print(
-        _dim(f"\n\n  {tps:.1f} tok/s  ·  {n_tokens} tokens  ·  {elapsed:.1f}s"),
-        flush=True,
-    )
+    bits = f"{tps:.1f} tok/s  ·  {n_tokens} tokens  ·  {elapsed:.1f}s"
+    print("\n\n" + tui.dim(f"      {bits}"), flush=True)
+
+
+def _print_help() -> None:
+    """Slash-command reference plus a few ready-to-paste commands."""
+    print()
+    print(tui.rule("commands"))
+    for cmd, desc in [
+        ("/quit", "end the session"),
+        ("/clear", "forget the conversation so far"),
+        ("/stats", "memory and tuning for this session"),
+        ("/help", "this list"),
+    ]:
+        print(tui.kv(cmd, tui.dim(desc), 10))
+    print()
+    print(tui.rule("fast, resident (fits in RAM)"))
+    print(tui.dim("      swlp chat qwen-7b --quant int4"))
+    print(tui.dim("      swlp chat mistral-7b --quant int8      # byte-identical to fp16"))
+    print()
+    print(tui.rule("lossless, streamed (bigger than RAM)"))
+    print(tui.dim("      swlp pull qwen-14b                      # one-time"))
+    print(tui.dim("      swlp chat --shard-dir ./shards/qwen-14b --window 2"))
+    print()
+
+
+def _print_stats(runner: object) -> None:
+    """Live memory picture — the number that decides what you can run."""
+    print()
+    print(tui.rule("session"))
+    try:
+        import mlx.core as mx
+
+        print(tui.kv("mlx active", f"{mx.get_active_memory() / 1024 ** 3:.2f} GB"))
+        print(tui.kv("mlx peak", f"{mx.get_peak_memory() / 1024 ** 3:.2f} GB"))
+        print(tui.kv("mlx cache", f"{mx.get_cache_memory() / 1024 ** 3:.2f} GB"))
+    except Exception:
+        pass
+    try:
+        import psutil
+
+        vm = psutil.virtual_memory()
+        print(tui.kv("system RAM", f"{vm.used / 1024 ** 3:.1f} / {vm.total / 1024 ** 3:.0f} GB"))
+    except Exception:
+        pass
+    tuning = getattr(runner, "tuning", None)
+    if tuning is not None:
+        print(tui.kv("tuning", tuning.summary()))
+        for n in tuning.notes:
+            print(tui.kv("", tui.dim(n)))
+    degraded = getattr(runner, "degradations", None)
+    if degraded:
+        print(tui.kv("degradations", tui.yellow(str(len(degraded)))))
+    print()
 
 
 # ── Main REPL ─────────────────────────────────────────────────────────────────
@@ -148,36 +168,46 @@ def run_chat(config: AppConfig, max_tokens: int = 512) -> None:
     model_id = config.model.model_id.split("/")[-1]  # short name for display
     quant = config.runtime.mlx_quant if backend == "mlx" else None
 
-    # --quant is an MLX-only flag; warn early so users know it has no effect here.
-    if backend != "mlx" and config.runtime.mlx_quant:
-        print(
-            _yellow(
-                f"  Warning: --quant {config.runtime.mlx_quant!r} is only supported "
-                f"with --backend mlx and is ignored for backend={backend!r}.\n"
-                f"  Use: swlp chat --backend mlx --quant {config.runtime.mlx_quant}\n"
-            )
-        )
+    # NOTE: there is deliberately no "--quant ignored" warning here. `--quant`
+    # already implies `--backend mlx` in _resolve_backend(), so the only way to
+    # reach this point with a non-mlx backend is the *default* mlx_quant value
+    # — warning about it fired on every mock/hf/swlp session and meant nothing.
 
     # When SWLP is used without --shard-dir the full model loads into RAM.  That
     # works for small models but OOMs for 7B+ on 16 GB.  Give a heads-up.
     if backend == "swlp" and not config.runtime.shard_dir:
-        print(
-            _yellow(
-                "  Note: --backend swlp without --shard-dir loads the full model into RAM.\n"
-                "  For 7B+ models on 16 GB, run 'swlp download --model <name>' first,\n"
-                "  then: swlp chat --shard-dir ./shards/<name> --window 2\n"
-            )
-        )
+        tui.warn("--backend swlp without --shard-dir loads the whole model into RAM.")
+        tui.note("for 7B+ on 16 GB: swlp pull <model>, then --shard-dir ./shards/<model>")
 
-    _banner(model_id, backend, quant)
+    extra: list[str] = []
+    if config.runtime.shard_dir:
+        extra.append(f"shards={config.runtime.shard_dir}")
+        extra.append(f"window={config.runtime.swlp_window_size}")
+    if backend == "mlx" and config.runtime.mlx_kv_bits in (4, 8):
+        extra.append(f"kv={config.runtime.mlx_kv_bits}-bit")
+    if config.runtime.mlx_draft_model or config.runtime.swlp_draft_model:
+        extra.append(f"draft={config.runtime.mlx_draft_model or config.runtime.swlp_draft_model}")
+
+    _banner(model_id, backend, quant, extra)
 
     # Pre-load the model once so the first turn isn't slow and the tokenizer
     # is available for chat-template formatting before the REPL starts.
     # mock has no model to load; all real backends (mlx, hf, swlp) expose .load().
     if backend != "mock":
-        print(_dim("  Loading model…"), end="\r", flush=True)
-        runner.load()  # type: ignore[union-attr]
-        print(" " * 30, end="\r", flush=True)  # clear the loading line
+        with tui.Spinner(f"loading {model_id}") as sp:
+            runner.load()  # type: ignore[union-attr]
+        tui.note(f"ready in {sp.elapsed:.1f}s")
+        tuning = getattr(runner, "tuning", None)
+        if tuning is not None and tuning.wired_limit_mb:
+            tui.note(tuning.summary().lower())
+        print()
+
+    # Phase 26: prefix KV reuse across turns — each turn's prefill then only
+    # streams the suffix (lossless; identical prefixes ⇒ identical KV).
+    if hasattr(runner, "set_prefix_cache") and backend == "swlp":
+        from .core.prefix_cache import PrefixKVCache
+
+        runner.set_prefix_cache(PrefixKVCache())  # type: ignore[union-attr]
 
     # Grab tokenizer for chat template (all real runners expose .tokenizer after load()).
     tokenizer = getattr(runner, "tokenizer", None)
@@ -199,40 +229,21 @@ def run_chat(config: AppConfig, max_tokens: int = 512) -> None:
         if user_input.startswith("/"):
             cmd = user_input.lower()
             if cmd in ("/quit", "/exit", "/q"):
-                print(_dim("\n  Goodbye.\n"))
+                print(tui.dim("\n  bye.\n"))
                 break
             if cmd in ("/clear", "/reset"):
                 session.clear()
-                print(_dim("  History cleared.\n"))
+                tui.ok("history cleared")
+                print()
                 continue
             if cmd in ("/help", "/?"):
-                print(
-                    _dim(
-                        "\n  Commands:\n"
-                        "    /quit    — exit\n"
-                        "    /clear   — reset conversation history\n"
-                        "    /help    — show this message\n"
-                        "\n"
-                        "  Start a new chat with a different model:\n"
-                        "    swlp chat --model smollm-1.7b  --backend mlx --quant int4\n"
-                        "    swlp chat --model qwen-7b       --backend mlx --quant int4\n"
-                        "    swlp chat --model phi-3.5       --backend mlx --quant int4\n"
-                        "    swlp chat --model mistral-7b    --backend mlx --quant int4\n"
-                        "    swlp chat --model mistral-24b   --backend mlx --quant int4\n"
-                        "\n"
-                        "  Stream a model larger than RAM (FP16, lossless):\n"
-                        "    swlp download --model mistral-7b    # one-time shard to ./shards/\n"
-                        "    swlp download --model mistral-24b\n"
-                        "    swlp download --model qwen-7b\n"
-                        "    swlp download --model qwen-14b\n"
-                        "    swlp chat --shard-dir ./shards/<name> --window 2\n"
-                        "\n"
-                        "  Any HuggingFace model id also works:\n"
-                        "    swlp chat --model google/gemma-2-2b-it --backend mlx --quant int4\n"
-                    )
-                )
+                _print_help()
                 continue
-            print(_yellow(f"  Unknown command: {user_input}  (try /help)\n"))
+            if cmd in ("/stats", "/mem"):
+                _print_stats(runner)
+                continue
+            tui.warn(f"unknown command {user_input} — try /help")
+            print()
             continue
 
         # ── build prompt with history ──────────────────────────────────────
@@ -244,14 +255,20 @@ def run_chat(config: AppConfig, max_tokens: int = 512) -> None:
         token_count = 0
         gen_start = time.perf_counter()
 
+        wrapper = tui.StreamWrapper(indent="      ")
         try:
             for token_text in runner.stream_tokens(prompt, max_tokens=max_tokens):  # type: ignore[union-attr]
-                print(token_text, end="", flush=True)
+                piece = wrapper.feed(token_text)
+                if piece:
+                    print(piece, end="", flush=True)
                 response_parts.append(token_text)
                 token_count += 1
+            tail = wrapper.finish()
+            if tail:
+                print(tail, end="", flush=True)
         except KeyboardInterrupt:
             # Ctrl+C stops the current generation but keeps the session alive.
-            print(_yellow("  [interrupted]"), end="")
+            print(tui.yellow(" [interrupted]"), end="")
 
         elapsed = time.perf_counter() - gen_start
         tps = token_count / elapsed if elapsed > 0 else 0.0

@@ -135,3 +135,21 @@ def test_build_runner_returns_speculative_runner():
     runner = build_runner(config)
     assert isinstance(runner, SpeculativeRunner)
     assert runner.backend == "speculative"
+
+
+# ── Phase 26: multi-resolution n-gram fallback ──────────────────────────────
+
+def test_drafter_backs_off_to_shorter_ngram():
+    """No trigram repeat, but the trailing bigram repeats → still drafts."""
+    drafter = NgramDrafter(SpeculativeConfig(ngram_size=3, max_draft=4))
+    # Trailing trigram (7,4,5) is unique; trailing bigram (4,5) occurs at
+    # index 1, followed by 10, 11 — the backoff draft.
+    tokens = [9, 4, 5, 10, 11, 7, 4, 5]
+    assert drafter.propose(tokens) == [10, 11, 7, 4]
+
+
+def test_drafter_backs_off_all_the_way_to_unigram():
+    drafter = NgramDrafter(SpeculativeConfig(ngram_size=3, max_draft=2))
+    # No repeated bi/trigram; trailing token 5 occurred at index 3 → [6, 7].
+    tokens = [1, 2, 3, 5, 6, 7, 8, 9, 5]
+    assert drafter.propose(tokens) == [6, 7]

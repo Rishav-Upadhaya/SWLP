@@ -31,7 +31,7 @@ class StepContext:
     position_ids: torch.Tensor | None
     causal_mask: torch.Tensor | None
     position_embeddings: tuple[torch.Tensor, torch.Tensor] | None
-    past_state: Any  # list[tuple] for gpt2; DynamicCache for llama/mistral
+    past_state: Any  # DynamicCache (gpt2 and llama/mistral)
     padding_mask: torch.Tensor | None = None  # [N, total_len] 1/0 mask for batched runs
 
 
@@ -85,8 +85,15 @@ class GPT2Adapter:
         t = model.transformer
         return [t.wte, t.wpe, t.drop, t.ln_f, model.lm_head]
 
-    def init_past_state(self, model: nn.Module, num_layers: int) -> list:
-        return [None] * num_layers
+    def init_past_state(self, model: nn.Module, num_layers: int) -> Any:
+        from transformers.cache_utils import DynamicCache
+
+        # transformers ≥5 GPT-2 blocks mutate a shared Cache in place via
+        # cache.update(...) and return only hidden states — the legacy
+        # per-layer tuple protocol no longer exists. A bare DynamicCache()
+        # (no config pre-sizing) matches the Llama-like path and is safe for
+        # the batch-1 streaming this adapter serves.
+        return DynamicCache()
 
     def prepare_step(
         self,
@@ -120,15 +127,39 @@ class GPT2Adapter:
     def call_block(
         self, block: nn.Module, ctx: StepContext, layer_idx: int
     ) -> tuple[torch.Tensor, Any]:
-        layer_past = ctx.past_state[layer_idx] if ctx.past_state else None
-        outputs = block(ctx.hidden_states, past_key_values=layer_past, use_cache=True)
+        attention_mask = None
+        query_len = int(ctx.hidden_states.shape[1])
+        cache = ctx.past_state
+        # Per-layer past length BEFORE this block's in-place update: earlier
+        # layers of the same sweep have already appended their keys to the
+        # shared cache, so the global length would overcount this layer's KV.
+        past_len = int(cache.get_seq_length(layer_idx)) if cache is not None else 0
+        if past_len > 0 and query_len > 1:
+            # Chunked prefill / prefix-suffix: queries > 1 over a non-empty
+            # past need the bottom-right-aligned causal mask. With no mask,
+            # sdpa's default top-left triangle wrongly hides the chunk's own
+            # prefix from its earlier queries. Query i (global position
+            # past+i) attends kv j <= i + past_len, so block j - i > past_len.
+            min_value = torch.finfo(ctx.hidden_states.dtype).min
+            full = torch.full((query_len, past_len + query_len), min_value,
+                              device=ctx.hidden_states.device,
+                              dtype=ctx.hidden_states.dtype)
+            causal = torch.triu(full, diagonal=1 + past_len)
+            attention_mask = causal[None, None, :, :]
+        outputs = block(
+            ctx.hidden_states,
+            past_key_values=cache,
+            attention_mask=attention_mask,
+            use_cache=True,
+        )
+        # transformers ≥5 GPT2Block returns bare hidden states; the KV cache
+        # was updated in place inside attention. Keep the tuple shape of the
+        # ArchAdapter contract with a None present.
         if isinstance(outputs, tuple):
             hidden_states = outputs[0]
-            present = outputs[1] if len(outputs) > 1 else None
         else:
             hidden_states = outputs
-            present = None
-        return hidden_states, present
+        return hidden_states, None
 
     def final_norm(self, model: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
         return model.transformer.ln_f(hidden_states)
@@ -158,6 +189,11 @@ class LlamaLikeAdapter:
     def init_past_state(self, model: nn.Module, num_layers: int) -> Any:
         from transformers.cache_utils import DynamicCache
 
+        # Hybrid models (qwen3_5: Gated-DeltaNet + full attention) need the
+        # config-structured cache — linear-attention layers hold conv/recurrent
+        # state, not K/V. ponytail: batched (N>1) streaming unverified for these.
+        if "linear_attention" in (getattr(model.config, "layer_types", None) or ()):
+            return DynamicCache(config=model.config)
         # Plain DynamicCache() — grows dynamically and handles any batch size.
         # DynamicCache(config=...) pre-structures the per-layer cache for the
         # config's layout and silently corrupts batched (N>1) K/V writes, so
@@ -194,7 +230,12 @@ class LlamaLikeAdapter:
 
         position_embeddings = None
         if hasattr(inner, "rotary_emb"):
-            position_embeddings = inner.rotary_emb(inputs_embeds, position_ids=position_ids)
+            rope_ids = position_ids
+            if hasattr(inner.rotary_emb, "mrope_section"):
+                # mRoPE (qwen3_5) rotates over 3 axes; for text-only input every
+                # axis is the token position, which is what HF's forward builds.
+                rope_ids = position_ids[None].expand(3, *position_ids.shape)
+            position_embeddings = inner.rotary_emb(inputs_embeds, position_ids=rope_ids)
 
         causal_mask = _build_causal_mask(
             model.config, inputs_embeds, past_state, position_ids, attention_mask
@@ -212,9 +253,12 @@ class LlamaLikeAdapter:
     def call_block(
         self, block: nn.Module, ctx: StepContext, layer_idx: int
     ) -> tuple[torch.Tensor, Any]:
+        mask = ctx.causal_mask
+        if getattr(block, "layer_type", None) == "linear_attention":
+            mask = _linear_attn_mask(ctx)
         outputs = block(
             ctx.hidden_states,
-            attention_mask=ctx.causal_mask,
+            attention_mask=mask,
             position_ids=ctx.position_ids,
             past_key_values=ctx.past_state,
             use_cache=True,
@@ -242,6 +286,15 @@ class LlamaLikeAdapter:
         )
         bytes_per = torch.tensor([], dtype=dtype).element_size()
         return 2 * n_layer * n_kv_heads * head_dim * bytes_per
+
+
+def _linear_attn_mask(ctx: StepContext) -> torch.Tensor | None:
+    """Padding mask for linear-attention layers — mirrors HF's
+    ``_update_linear_attn_mask``: only needed on an uncached, padded prefill."""
+    mask = ctx.padding_mask
+    if mask is None or bool(torch.all(mask == 1)) or ctx.past_state.has_previous_state():
+        return None
+    return mask
 
 
 def _build_causal_mask(
@@ -298,6 +351,7 @@ _LLAMA_LIKE_TYPES = {
     "mistral",
     "qwen2",
     "qwen3",
+    "qwen3_5",
     "phi",
     "phi3",
     "gemma",
@@ -316,3 +370,4 @@ def get_adapter(model_type: str) -> ArchAdapter:
     # since all modern decoder-only models follow that layout.
     LOGGER.warning("arch_unknown_defaulting_llama_like", extra={"model_type": model_type})
     return LlamaLikeAdapter()
+

@@ -64,21 +64,29 @@ class NgramDrafter:
     def propose(self, tokens: list[int]) -> list[int]:
         """Return up to K draft tokens, or ``[]`` when no n-gram match is found.
 
+        Multi-resolution matching (Phase 26): the full ``ngram_size`` context
+        is tried first; on miss the drafter backs off to shorter contexts
+        (down to a single token), so near-miss phrasing still drafts. Drafts are
+        only ever *proposed* — the target verifies every one — so any match
+        strategy is lossless by construction.
+
         Args:
             tokens: all token IDs generated so far (prompt + completion).
 
         Returns:
             A list of 0..K proposed continuation token IDs.
         """
-        if self._k == 0 or len(tokens) <= self._n:
+        if self._k == 0 or len(tokens) <= 1:
             return []
-        pattern = tokens[-self._n:]
-        # Search backwards for the most recent earlier occurrence of `pattern`,
-        # excluding the trailing pattern itself.
-        for start in range(len(tokens) - self._n - 1, -1, -1):
-            if tokens[start:start + self._n] == pattern:
-                draft = tokens[start + self._n: start + self._n + self._k]
-                return list(draft)
+        for n in range(min(self._n, len(tokens) - 1), 0, -1):
+            pattern = tokens[-n:]
+            # Search backwards for the most recent earlier occurrence of
+            # `pattern`, excluding the trailing pattern itself.
+            for start in range(len(tokens) - n - 1, -1, -1):
+                if tokens[start:start + n] == pattern:
+                    draft = tokens[start + n: start + n + self._k]
+                    if draft:
+                        return list(draft)
         return []
 
 

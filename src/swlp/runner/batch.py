@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING
 import psutil
 import torch
 
-from ..core.kv_cache import KVCacheManager
 from ..metrics import RunMetrics, RunResult
 from .arch import ArchAdapter, get_adapter
 
@@ -110,8 +109,6 @@ def run_batch(
         return []
 
     torch.manual_seed(runner.config.generation.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(runner.config.generation.seed)
 
     memory_tracker = psutil.Process()
     peak_rss = 0
@@ -132,17 +129,7 @@ def run_batch(
         if hasattr(scheduler, "load_resident_layers"):
             scheduler.load_resident_layers()
 
-        try:
-            runner.kv_manager = KVCacheManager(
-                budget_bytes=runner._resolve_kv_budget_bytes(adapter, len(blocks)),
-                compression=bool(runner.config.runtime.kv_compression),
-                compression_level=runner._resolve_compression_level(),
-                tiering=bool(runner.config.runtime.kv_tiering),
-                device=runner.device,
-            )
-        except Exception:
-            LOGGER.exception("kv_manager_init_failed")
-            runner.kv_manager = KVCacheManager()
+        runner.kv_manager = runner.build_kv_manager(adapter, len(blocks))
 
         # ── batched, left-padded tokenization ──────────────────────────────
         # Left padding keeps every sequence's newest token in the last column,

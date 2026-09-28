@@ -32,7 +32,6 @@ class RunMetrics:
     per_token_latency_seconds: Sequence[float] | None = field(default=None)
     throughput_tokens_per_second: float | None = None
     generated_tokens: int | None = None
-    vram_peak_bytes: int | None = None
     ram_peak_bytes: int | None = None
     kv_cache_entries: int | None = None
     kv_cache_device_bytes: int | None = None
@@ -49,6 +48,12 @@ class RunMetrics:
     kv_cache_budget_bytes: int | None = None
     kv_cache_device_budget_bytes: int | None = None
     kv_cache_budget_violations: int | None = None
+    # Silent-degradation ledger: every hot-path failure that was caught and
+    # logged rather than raised (prefetch disabled, KV compression skipped,
+    # expert prefetch failed, …).  A run that produced numbers *and* degraded
+    # is not a clean measurement — these two fields say so in the output.
+    degradations: Sequence[str] | None = None
+    degradation_count: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)

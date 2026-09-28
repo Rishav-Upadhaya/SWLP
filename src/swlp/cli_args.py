@@ -33,6 +33,10 @@ MODEL_ALIASES = {
     # SmolLM2 (HuggingFace, Apache 2.0 — great for testing on low RAM)
     "smollm-1.7b": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
     "smollm-360m": "HuggingFaceTB/SmolLM2-360M-Instruct",
+    # MoE (Phase 25 — expert-streamed; see swlp doctor for guidance)
+    "qwen3-30b-a3b": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    "mixtral-8x7b": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash-0731",
 }
 
 
@@ -66,7 +70,24 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     )
     model_grp.add_argument(
         "--device", type=str, default=None,
-        help="target device: auto | cuda | mps | cpu",
+        help="target device: auto | mps | cpu",
+    )
+    model_grp.add_argument(
+        "--kv-bits", type=int, choices=(4, 8), default=None, dest="mlx_kv_bits",
+        help="quantize the KV cache (MLX). 4-bit is typically FASTER than fp16 "
+             "on unified memory — decode is bandwidth-bound, not compute-bound",
+    )
+    model_grp.add_argument(
+        "--max-kv-size", type=int, default=None, dest="max_kv_size",
+        help="cap KV cache length; bounds long-context RAM (lossy: drops oldest)",
+    )
+    model_grp.add_argument(
+        "--draft-tokens", type=int, default=None, dest="mlx_num_draft_tokens",
+        help="draft tokens per speculative step (default 4; 4-6 is the sweet spot)",
+    )
+    model_grp.add_argument(
+        "--wired-limit", type=str, default=None, dest="mlx_wired_limit",
+        help="Metal wired-memory ceiling: auto | off | <MB>  (default auto)",
     )
     model_grp.add_argument(
         "--cache-dir", type=Path, default=None,
@@ -77,8 +98,9 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
         "--draft-model", dest="draft_model", type=str, default=None,
         metavar="MODEL",
         help=(
-            "draft model for MLX speculative decoding  (alias or HF ID; "
-            "must share the same tokenizer as --model, e.g. smollm-360m)"
+            "draft model for speculative decoding  (alias or HF ID; must share "
+            "the target's tokenizer, e.g. qwen-0.5b for qwen-14b; with "
+            "--shard-dir selects the speculative backend, with --quant the MLX one)"
         ),
     )
     model_grp.add_argument(
@@ -130,6 +152,51 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
         help="hard RAM budget for the KV cache in megabytes",
     )
 
+    # Phase 23: quality-neutral speedups (always-on, no quality tradeoff).
+    perf_grp = parser.add_argument_group(
+        "performance (quality-neutral)",
+        "Speedups that do NOT affect output quality. Safe to enable always.",
+    )
+    perf_grp.add_argument(
+        "--no-activation-cache", action="store_true",
+        help="disable activation caching for prompt prefix reuse",
+    )
+    perf_grp.add_argument(
+        "--no-prealloc-buffer", action="store_true",
+        help="disable pre-allocated generate buffer (uses torch.cat instead)",
+    )
+
+    # Phase 23: opt-in quality tradeoffs (opt-in via flags).
+    tradeoff_grp = parser.add_argument_group(
+        "quality tradeoffs (opt-in)",
+        "Speedups that may reduce output quality. Each has a configurable level.",
+    )
+    tradeoff_grp.add_argument(
+        "--early-exit", default=None, metavar="THRESHOLD",
+        help=(
+            "skip remaining layers when next-token entropy < THRESHOLD (0.0-1.0). "
+            "Lower = more aggressive = faster but more quality risk. "
+            "Typical: 0.5 = moderate, 0.3 = aggressive. 'off' to disable."
+        ),
+    )
+    tradeoff_grp.add_argument(
+        "--layer-pruning", default=None, metavar="MODE",
+        choices=["off", "light", "aggressive"],
+        help=(
+            "remove least-important layers: light (~10%% removed, <0.5%% quality loss) "
+            "or aggressive (~25%% removed, ~1-3%% quality loss). Requires calibration."
+        ),
+    )
+    tradeoff_grp.add_argument(
+        "--adaptive-precision", default=None, metavar="MODE",
+        choices=["off", "fp8_late", "int8_late"],
+        help=(
+            "use FP16 for early layers, lower precision for later layers. "
+            "fp8_late: FP8 for last 50%% of layers. "
+            "int8_late: INT8 for last 50%% of layers."
+        ),
+    )
+
     # Internal SWLP tuning knobs — suppressed from help output.
     parser.add_argument("--swlp-prefetch-depth", type=int, default=None,
                         help=argparse.SUPPRESS)
@@ -167,38 +234,132 @@ def build_parser() -> argparse.ArgumentParser:
     _add_run_args(parser)
     subparsers = parser.add_subparsers(dest="command", title="commands", metavar="<command>")
 
-    # ── download ──────────────────────────────────────────────────────────
-    download_parser = subparsers.add_parser(
-        "download",
-        help="download and shard a model for streaming inference",
+    # ── run (one-command: auto-download + auto-shard + generate) ─────────
+    run_parser = subparsers.add_parser(
+        "run",
+        help="one command: download, shard, and run a model  (skips work already done)",
         description=(
-            "Download a HuggingFace model and split it into per-layer shards so it\n"
-            "can be streamed with --backend swlp, even if it is larger than available RAM.\n\n"
+            "The quick-start path: give an alias or HuggingFace id and SWLP handles\n"
+            "the rest — downloads weights, shards them for streaming if needed, and\n"
+            "generates. Already-sharded models are detected via the shard manifest\n"
+            "and reused without re-downloading.\n\n"
             "Examples:\n"
-            "  swlp download --model mistral-7b\n"
-            "  swlp download --model qwen-7b\n"
-            "  swlp download --model mistral-24b\n"
-            "  swlp download --model mistralai/Mistral-Small-24B-Instruct-2501"
+            "  swlp run mistral-7b --prompt \"Explain transformers.\"\n"
+            '  swlp run mistral-7b --chat\n'
+            "  swlp run google/gemma-2-2b-it --backend mlx --quant int4 --prompt \"Hi\""
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    download_parser.add_argument(
-        "--model", "--model-id", dest="model", type=str, required=True,
-        metavar="MODEL",
-        help=(
-            "alias (mistral-7b, mistral-24b, qwen-7b, smollm-1.7b, phi-3.5, …) "
-            "or any HuggingFace model ID"
+    _add_run_args(run_parser)
+    run_parser.add_argument(
+        "model_pos", nargs="?", default=None, metavar="MODEL",
+        help="model alias or HuggingFace id  (same as --model)",
+    )
+    run_parser.add_argument(
+        "--max-chat-tokens", dest="max_chat_tokens", type=int, default=512,
+        metavar="N",
+        help="max new tokens per reply with --chat  (default: 512)",
+    )
+    run_parser.add_argument(
+        "--chat", action="store_true",
+        help="start interactive chat after setup instead of one-shot generation",
+    )
+
+    # ── serve ────────────────────────────────────────────────────────────
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="OpenAI-compatible HTTP server with SSE token streaming",
+        description=(
+            "Serve a model behind /v1/chat/completions and /v1/completions using\n"
+            "the OpenAI API shape (stream=true yields SSE chunks). Works with any\n"
+            "backend including the FP16 streaming path.\n\n"
+            "Examples:\n"
+            "  swlp serve ./shards/mistral-7b\n"
+            "  swlp serve mistral-7b --backend mlx --quant int8\n"
+            "  swlp serve --shard-dir ./shards/qwen-14b --port 9000"
         ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    download_parser.add_argument(
-        "--output-dir", dest="output_dir", type=Path, default=None,
-        metavar="DIR",
-        help="destination directory for shards  (default: ./shards/<model-name>)",
+    _add_run_args(serve_parser)
+    serve_parser.add_argument(
+        "model_pos", nargs="?", default=None, metavar="MODEL",
+        help="alias or HF id or shard dir  (same as --model/--shard-dir)",
     )
-    download_parser.add_argument(
-        "--cache-dir", type=Path, default=None,
-        metavar="DIR",
-        help="HuggingFace cache directory",
+    serve_parser.add_argument("--host", default="127.0.0.1",
+                              help="bind address  (default: 127.0.0.1)")
+    serve_parser.add_argument("--port", type=int, default=8080,
+                              help="port  (default: 8080)")
+
+    # ── download / pull ───────────────────────────────────────────────────
+    for cmd in ("download", "pull"):
+        is_pull = cmd == "pull"
+        download_parser = subparsers.add_parser(
+            cmd,
+            help=(
+                "download and shard a model for streaming inference"
+                + (" (with disk-space preflight)" if is_pull else "")
+            ),
+            description=(
+                "Download a HuggingFace model and split it into per-layer shards so it\n"
+                "can be streamed with --backend swlp, even if it is larger than available RAM.\n\n"
+                + (
+                    "pull additionally checks free disk space against the model's\n"
+                    "known FP16 size before downloading.\n\n"
+                    if is_pull else ""
+                )
+                + "Examples:\n"
+                "  swlp download --model mistral-7b\n"
+                "  swlp pull --model qwen-7b\n"
+                "  swlp pull --model mistral-24b\n"
+                "  swlp pull --model mistralai/Mistral-Small-24B-Instruct-2501"
+            ),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        download_parser.add_argument(
+            "--model", "--model-id", dest="model", type=str, required=True,
+            metavar="MODEL",
+            help=(
+                "alias (mistral-7b, mistral-24b, qwen-7b, smollm-1.7b, phi-3.5, …) "
+                "or any HuggingFace model ID"
+            ),
+        )
+        download_parser.add_argument(
+            "--output-dir", dest="output_dir", type=Path, default=None,
+            metavar="DIR",
+            help="destination directory for shards  (default: ./shards/<model-name>)",
+        )
+        download_parser.add_argument(
+            "--cache-dir", type=Path, default=None,
+            metavar="DIR",
+            help="HuggingFace cache directory",
+        )
+
+    # ── compress-shards ───────────────────────────────────────────────────
+    compress_parser = subparsers.add_parser(
+        "compress-shards",
+        help="losslessly compress a shard directory in place (~31%% smaller, bit-exact)",
+        description=(
+            "Convert layer shards to compressed .swz files (zipnn: zstd + Huffman over\n"
+            "byte-grouped FP16/BF16 weights). Bit-exact: every layer is roundtrip-verified\n"
+            "before its original is deleted. Streaming reads compressed shards directly.\n\n"
+            "Throughput depends on your SSD: below ~3.5 GB/s sequential read the smaller\n"
+            "reads win; above it (fast Apple Silicon SSDs) decompression costs ~25% tok/s.\n"
+            "The ~31% disk saving applies either way. Use --revert to restore plain\n"
+            "shards when streaming speed matters more than disk space.\n\n"
+            "Examples:\n"
+            "  swlp compress-shards ./shards/mistral-7b\n"
+            "  swlp compress-shards --revert ./shards/mistral-7b"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    compress_parser.add_argument(
+        "shard_dir", type=Path,
+        metavar="SHARD_DIR",
+        help="shard directory produced by `swlp download`",
+    )
+    compress_parser.add_argument(
+        "--revert", action="store_true",
+        help="restore plain .safetensors layers from .swz (SHA-verified, resumable)",
     )
 
     # ── chat ──────────────────────────────────────────────────────────────
@@ -218,6 +379,10 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_run_args(chat_parser)
+    chat_parser.add_argument(
+        "model_pos", nargs="?", default=None, metavar="MODEL",
+        help="model alias or HuggingFace id  (same as --model)",
+    )
     chat_parser.add_argument(
         "--max-chat-tokens", dest="max_chat_tokens", type=int, default=512,
         metavar="N",
@@ -359,6 +524,219 @@ def build_parser() -> argparse.ArgumentParser:
     )
     suite_report_parser.add_argument("path", type=Path, help="path to a suite JSON or CSV file")
 
+    # ── policy-report ─────────────────────────────────────────────────────
+    policy_report_parser = subparsers.add_parser(
+        "policy-report",
+        help="evaluate scheduler policy accuracy from cross-machine experiment data",
+        description=(
+            "Load a policy validation matrix (CSV/JSON) and report predictive accuracy:\n"
+            "resident-layer MAE, within ±2-layer rate, and throughput regret.\n\n"
+            "Required columns: machine, model, pipeline_ratio, free_ram_gb,\n"
+            "resident_count, throughput_tokens_per_second\n\n"
+            "Optional columns: workload, quant\n\n"
+            "Example:\n"
+            "  swlp policy-report experiments/policy_matrix.csv"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    policy_report_parser.add_argument(
+        "path",
+        type=Path,
+        help="path to a policy validation matrix CSV or JSON file",
+    )
+
+    # ── profile ───────────────────────────────────────────────────────────
+    profile_parser = subparsers.add_parser(
+        "profile",
+        help="run inference with full pipeline profiling and export JSON traces",
+        description=(
+            "Run inference with the fine-grained profiler enabled.  Collects per-layer\n"
+            "timestamps for SSD read, deserialization, upload, compute, and eviction.\n"
+            "Exports a JSON trace file with hardware metadata, pipeline metrics, and\n"
+            "raw timestamps for timeline visualization.\n\n"
+            "Examples:\n"
+            "  swlp profile --shard-dir ./shards/mistral-7b --prompt \"Hello\" "
+            "--output traces.json\n"
+            "  swlp profile --model mistral-7b --max-tokens 16\n"
+            "  swlp profile --backend mock --max-tokens 8 --output mock_traces.json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_run_args(profile_parser)
+    profile_parser.add_argument(
+        "--output", type=Path, default=None,
+        help="output JSON trace file  (default: layer_traces.json)",
+    )
+    profile_parser.add_argument(
+        "--timeline", action="store_true",
+        help="print the per-layer timeline table to stdout",
+    )
+    profile_parser.add_argument(
+        "--detail", action="store_true",
+        help="print per-layer block detail to stdout",
+    )
+    profile_parser.add_argument(
+        "--summary", action="store_true",
+        help="print pipeline metrics summary to stdout",
+    )
+
+    # ── sim ───────────────────────────────────────────────────────────────
+    sim_parser = subparsers.add_parser(
+        "sim",
+        help="run the scheduler simulator — no model or GPU required",
+        description=(
+            "Simulate the SWLP streaming scheduler with configurable parameters.\n"
+            "Produces the same timeline and metrics as the real profiler but without\n"
+            "loading any model.  Useful for rapid parameter exploration.\n\n"
+            "Examples:\n"
+            "  swlp sim --layers 32 --layer-size-mb 512 --window 2 --prefetch 4\n"
+            "  swlp sim --layers 80 --layer-size-mb 700 --window 4 --tokens 20 --report\n"
+            "  swlp sim --layers 32 --resident 8 --output sim.json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sim_parser.add_argument("--layers", type=int, default=32, metavar="N",
+                            help="number of transformer layers (default: 32)")
+    sim_parser.add_argument("--layer-size-mb", type=float, default=512, metavar="MB",
+                            help="size of each layer in MB (default: 512)")
+    sim_parser.add_argument("--ram-gb", type=float, default=16.0, metavar="GB",
+                            help="total RAM in GB (default: 16)")
+    sim_parser.add_argument("--window", type=int, default=2, metavar="N",
+                            help="sliding window size (default: 2)")
+    sim_parser.add_argument("--prefetch", type=int, default=4, metavar="N",
+                            help="prefetch depth (default: 4)")
+    sim_parser.add_argument("--workers", type=int, default=2, metavar="N",
+                            help="worker thread count (default: 2)")
+    sim_parser.add_argument("--compute-ms", type=float, default=50.0, metavar="MS",
+                            help="simulated compute time per layer in ms (default: 50)")
+    sim_parser.add_argument("--ssd-ms", type=float, default=30.0, metavar="MS",
+                            help="simulated SSD read latency in ms (default: 30)")
+    sim_parser.add_argument("--upload-ms", type=float, default=10.0, metavar="MS",
+                            help="simulated upload latency in ms (default: 10)")
+    sim_parser.add_argument("--evict-ms", type=float, default=5.0, metavar="MS",
+                            help="simulated eviction latency in ms (default: 5)")
+    sim_parser.add_argument("--tokens", type=int, default=10, metavar="N",
+                            help="number of tokens to simulate (default: 10)")
+    sim_parser.add_argument("--resident", type=int, default=0, metavar="N",
+                            help="number of resident (never-evicted) layers (default: 0)")
+    sim_parser.add_argument("--output", type=Path, default=None,
+                            help="output JSON file  (default: sim_traces.json)")
+    sim_parser.add_argument("--report", action="store_true",
+                            help="print a formatted summary to stdout")
+
+    # ── analyze ──────────────────────────────────────────────────────────
+    analyze_parser = subparsers.add_parser(
+        "analyze",
+        help="analyze profiler traces and produce actionable recommendations",
+        description=(
+            "Load a JSON trace file produced by `swlp profile` and analyze it.\n"
+            "Identifies the pipeline bottleneck, GPU idle reasons, prefetch efficiency,\n"
+            "memory headroom, and generates specific recommendations.\n\n"
+            "Examples:\n"
+            "  swlp analyze layer_traces.json\n"
+            "  swlp analyze layer_traces.json --json\n"
+            "  swlp analyze traces.json --output analysis.txt"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    analyze_parser.add_argument(
+        "trace_file", type=Path, help="path to JSON trace file from swlp profile"
+    )
+    analyze_parser.add_argument("--json", dest="analyze_json", action="store_true",
+                                help="output analysis as JSON instead of text")
+    analyze_parser.add_argument("--output", type=Path, default=None,
+                                help="write report to file instead of stdout")
+
+    # ── sweep ────────────────────────────────────────────────────────────
+    sweep_parser = subparsers.add_parser(
+        "sweep",
+        help="sweep simulator parameters and produce a structured dataset",
+        description=(
+            "Run the scheduler simulator across multiple parameter combinations.\n"
+            "Produces a structured JSON or CSV dataset for analysis.\n\n"
+            "Examples:\n"
+            "  swlp sweep --layers 32,80 --ram 16,24,32 --window 2,4 --resident 0,4,8\n"
+            "  swlp sweep --layers 32 --layer-size-mb 512 --ram 16,24,32 --output sweep.json\n"
+            "  swlp sweep --layers 80 --ram 16,24,32,48,64 --resident 0,2,4,8,16 --csv"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sweep_parser.add_argument("--layers", type=str, default="32",
+                              help="comma-separated layer counts (default: 32)")
+    sweep_parser.add_argument("--layer-size-mb", type=str, default="512",
+                              help="comma-separated layer sizes in MB (default: 512)")
+    sweep_parser.add_argument("--ram", type=str, default="16",
+                              help="comma-separated RAM sizes in GB (default: 16)")
+    sweep_parser.add_argument("--window", type=str, default="2",
+                              help="comma-separated window sizes (default: 2)")
+    sweep_parser.add_argument("--prefetch", type=str, default="4",
+                              help="comma-separated prefetch depths (default: 4)")
+    sweep_parser.add_argument("--resident", type=str, default="0",
+                              help="comma-separated resident layer counts (default: 0)")
+    sweep_parser.add_argument("--tokens", type=int, default=10, metavar="N",
+                              help="number of tokens to simulate (default: 10)")
+    sweep_parser.add_argument("--compute-ms", type=float, default=50.0, metavar="MS",
+                              help="compute time per layer in ms (default: 50)")
+    sweep_parser.add_argument("--ssd-ms", type=float, default=30.0, metavar="MS",
+                              help="SSD read latency in ms (default: 30)")
+    sweep_parser.add_argument("--upload-ms", type=float, default=10.0, metavar="MS",
+                              help="upload latency in ms (default: 10)")
+    sweep_parser.add_argument("--workers", type=int, default=2, metavar="N",
+                              help="worker thread count (default: 2)")
+    sweep_parser.add_argument("--output", type=Path, default=None,
+                              help="output file path  (default: sweep_results.json)")
+    sweep_parser.add_argument("--csv", action="store_true",
+                              help="output as CSV instead of JSON")
+    sweep_parser.add_argument("--report", action="store_true",
+                              help="print a formatted table to stdout")
+
+    # ── evaluate ─────────────────────────────────────────────────────────
+    evaluate_parser = subparsers.add_parser(
+        "evaluate",
+        help="compare scheduling policies side-by-side",
+        description=(
+            "Run multiple scheduling policies on the same workload and compare.\n"
+            "Policies: baseline, resident_N, window_N, prefetch_N\n\n"
+            "Examples:\n"
+            "  swlp evaluate --policies baseline,resident_4,resident_8\n"
+            "  swlp evaluate --layers 80 --ram 24 "
+            "--policies baseline,resident_4,resident_8,window_4\n"
+            "  swlp evaluate --policies baseline,resident_2,resident_4,resident_8,resident_16 "
+            "--output eval.json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    evaluate_parser.add_argument(
+        "--policies", type=str, default="baseline,resident_4,resident_8",
+        help="comma-separated policy names (default: baseline,resident_4,resident_8)",
+    )
+    evaluate_parser.add_argument("--layers", type=int, default=32, metavar="N",
+                                 help="number of transformer layers (default: 32)")
+    evaluate_parser.add_argument("--layer-size-mb", type=float, default=512, metavar="MB",
+                                 help="size of each layer in MB (default: 512)")
+    evaluate_parser.add_argument("--ram", type=float, default=16, metavar="GB",
+                                 help="total RAM in GB (default: 16)")
+    evaluate_parser.add_argument("--window", type=int, default=2, metavar="N",
+                                 help="base window size (default: 2)")
+    evaluate_parser.add_argument("--prefetch", type=int, default=4, metavar="N",
+                                 help="base prefetch depth (default: 4)")
+    evaluate_parser.add_argument("--tokens", type=int, default=10, metavar="N",
+                                 help="number of tokens to simulate (default: 10)")
+    evaluate_parser.add_argument("--compute-ms", type=float, default=50.0, metavar="MS",
+                                 help="compute time per layer in ms (default: 50)")
+    evaluate_parser.add_argument("--ssd-ms", type=float, default=30.0, metavar="MS",
+                                 help="SSD read latency in ms (default: 30)")
+    evaluate_parser.add_argument("--upload-ms", type=float, default=10.0, metavar="MS",
+                                 help="upload latency in ms (default: 10)")
+    evaluate_parser.add_argument("--workers", type=int, default=2, metavar="N",
+                                 help="worker thread count (default: 2)")
+    evaluate_parser.add_argument("--output", type=Path, default=None,
+                                 help="output file path  (default: eval_results.json)")
+    evaluate_parser.add_argument("--csv", action="store_true",
+                                 help="output as CSV instead of JSON")
+    evaluate_parser.add_argument("--report", action="store_true",
+                                 help="print a formatted comparison table to stdout")
+
     # ── package ───────────────────────────────────────────────────────────
     package_parser = subparsers.add_parser(
         "package",
@@ -416,6 +794,30 @@ def build_parser() -> argparse.ArgumentParser:
                               help="layer to inspect: numeric index (0, 1, …) or full name")
     layer_parser.add_argument("--json-output", action="store_true",
                               help="print the tensor payload as JSON")
+
+    # ── doctor ────────────────────────────────────────────────────────────
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="diagnose hardware and predict best-observed scheduling configuration",
+        description=(
+            "Probe hardware, measure pipeline characteristics, predict best-observed\n"
+            "resident cache configuration, and explain every decision.\n\n"
+            "Examples:\n"
+            "  swlp doctor                    # diagnose all known models\n"
+            "  swlp doctor mistral-7b         # diagnose specific model"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    doctor_parser.add_argument(
+        "model", nargs="?", default=None,
+        help="optional model alias to diagnose (default: all known models)",
+    )
+
+    # ── models ────────────────────────────────────────────────────────────
+    subparsers.add_parser(
+        "models",
+        help="list model aliases with sizes and HuggingFace ids",
+    )
 
     # ── help ──────────────────────────────────────────────────────────────
     subparsers.add_parser("help", help="show a categorised command reference")

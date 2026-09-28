@@ -81,12 +81,6 @@ def _json_load(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _sha256_bytes(data: bytes) -> str:
-    digest = hashlib.sha256()
-    digest.update(data)
-    return digest.hexdigest()
-
-
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -486,8 +480,3 @@ def validate_package(package_dir: Path) -> ValidationResult:
         errors.append("manifest total_size_bytes does not match layer totals")
 
     return ValidationResult(valid=not errors, errors=errors, warnings=warnings)
-
-
-def describe_manifest(package_dir: Path) -> dict[str, Any]:
-    manifest = load_manifest(package_dir)
-    return asdict(manifest)

@@ -121,7 +121,15 @@ if __name__ == "__main__":
     print(f"  Write (256 MB): {w:.2f} GB/s")
     r = measure_ssd_read(256)
     print(f"  Read  (256 MB): {r:.2f} GB/s")
-    print("  NOTE: record these — they set your window_size target")
+
+    # Persist the measured read bandwidth so detect_hardware() (and through it
+    # the residency planner / pipeline model) uses real numbers instead of the
+    # hardcoded platform defaults.
+    from swlp.hardware.detect import bandwidth_cache_path, save_measured_bandwidth
+
+    save_measured_bandwidth(r)
+    print(f"  Saved measurement to {bandwidth_cache_path()}")
+    print("  (SWLP_SSD_BW_GBPS env var overrides it; delete the file to reset)")
 
     check_torch()
     check_mlx()

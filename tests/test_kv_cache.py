@@ -5,7 +5,6 @@ import torch
 
 from swlp.core.kv_cache import KVCacheManager
 
-
 # ── existing tests ─────────────────────────────────────────────────────────
 
 
@@ -145,6 +144,28 @@ def test_clear_deletes_disk_files(tmp_path: Path) -> None:
     if spill_file:
         assert not Path(spill_file).exists()
     assert len(manager._entries) == 0
+
+
+def test_clear_resets_peaks_and_counters() -> None:
+    """After clear(), stats() must read as a virgin manager — peaks and op
+    counters included (Phase 24 round-1 audit fix)."""
+    a = torch.randn(8, 8)
+    manager = KVCacheManager(budget_bytes=1, compression=True, tiering=True)
+    manager.set(0, (a, a.clone()))
+    manager.get(0)  # bump move/op counters + peaks
+    manager.set(1, (a, a.clone()))  # force offload/compress accounting
+    before = manager.stats()
+    assert before["peak_total_bytes"] > 0, "expected nonzero peaks before clear"
+
+    manager.clear()
+    after = manager.stats()
+    fresh = KVCacheManager().stats()
+    for key in (
+        "peak_device_bytes", "peak_host_bytes", "peak_total_bytes",
+        "compressions", "decompressions", "offloads", "moves_to_device",
+        "disk_spills", "disk_loads", "budget_violations",
+    ):
+        assert after[key] == fresh[key], f"{key} not reset by clear(): {after[key]}"
 
 
 # ── Phase 16 kv_window tests ───────────────────────────────────────────────

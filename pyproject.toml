@@ -5,9 +5,31 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "swlp"
 version = "0.1.0"
-description = "Phase 0 baseline runtime for a local LLM project"
+description = "Sliding Window Layer Pipeline — run large LLMs on consumer hardware without quantization by streaming transformer layers through a sliding window."
 readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "Rishav Upadhaya", email = "rishavupadhaya266@gmail.com" },
+]
+keywords = [
+  "llm", "inference", "transformers", "memory-efficient",
+  "layer-streaming", "apple-silicon", "mlx", "fp16",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Typing :: Typed",
+]
 dependencies = [
   "torch>=2.2",
   "transformers>=4.41",
@@ -16,7 +38,6 @@ dependencies = [
   "safetensors>=0.4",
   "python-json-logger>=2.0",
   "psutil>=5.9",
-  "pyinstrument>=4.6",
 ]
 
 [project.optional-dependencies]
@@ -25,19 +46,28 @@ dev = [
   "pytest-cov>=5.0",
   "ruff>=0.5",
 ]
-gpu = [
-  "pynvml>=11.5",
+codec = [
+  "zipnn>=0.5.4",
 ]
 apple = [
-  "mlx>=0.16",
-  "mlx-lm>=0.16",
+  "mlx>=0.31",
+  "mlx-lm>=0.31",
 ]
 
 [project.scripts]
 swlp = "swlp.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/Rishav-Upadhaya/SWLP"
+Repository = "https://github.com/Rishav-Upadhaya/SWLP"
+Issues = "https://github.com/Rishav-Upadhaya/SWLP/issues"
+Documentation = "https://github.com/Rishav-Upadhaya/SWLP/tree/main/docs"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+swlp = ["py.typed"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

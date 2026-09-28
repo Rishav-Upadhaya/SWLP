@@ -47,7 +47,9 @@ pyrightconfig.json
 *.swo
 *~
 .project
-.claude
+# Track the contributor operating manual; ignore any local Claude Code state.
+.claude/*
+!.claude/CLAUDE.md
 .classpath
 .settings/
 *.sublime-project
@@ -128,9 +130,22 @@ profile_results/
 /tmp/
 
 # ─── Documentation build ──────────────────────────────────────────────────────
-docs
+# NOTE: do NOT ignore `docs/` — in mkdocs that is the *source* tree (ROADMAP.md,
+# results.md, etc., are hand-authored and must be version-controlled). Only the
+# build outputs below are ignored.
 site/
 .mkdocs/
 
 # ─── Tool-specific outputs ────────────────────────────────────────────────────
 graphify-out/
+
+# ─── Local research / paper artifacts (not part of the library) ───────────────
+# Large binaries and personal drafts kept locally; never part of the package.
+# Anchored to root so scripts/research/ (tracked) is not caught.
+/research/
+*.pdf
+*.docx
+
+# profiler / simulator output artifacts
+layer_traces.json
+sim_traces.json

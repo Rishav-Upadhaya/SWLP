@@ -1,12 +1,17 @@
-# SWLP — Sliding Window Layer Pipeline
-# Install: pip install -r requirements.txt
+# SWLP — reproducibility lockfile, NOT the dependency declaration.
 #
-# Or use extras for optional features:
-#   pip install swlp[apple]   — MLX backend (Apple Silicon)
-#   pip install swlp[gpu]     — NVIDIA VRAM tracking
-#   pip install swlp[dev]     — pytest + ruff
+# `pyproject.toml` is the single source of truth for what SWLP depends on.
+# This file pins the exact versions the published benchmark numbers in
+# docs/results.md were measured with, so a reviewer can reproduce the
+# measurement environment bit-for-bit. See docs/threats_to_validity.md.
+#
+# Normal install:        pip install -e ".[dev]"
+# Reproduce the paper:   pip install -r requirements.txt
+#
+# tests/test_architecture.py asserts these pins satisfy pyproject's
+# constraints, so the two files cannot silently drift apart again.
 
-# ── Core dependencies ──────────────────────────────────────────────────────────
+# ── Core (mirrors [project].dependencies) ─────────────────────────────────────
 torch==2.12.0
 transformers==5.8.1
 accelerate==1.13.0
@@ -14,21 +19,19 @@ huggingface-hub==1.15.0
 safetensors==0.7.0
 python-json-logger==4.1.0
 psutil==7.2.2
-pyinstrument==5.1.2
 
-# ── Dev dependencies (testing + linting) ───────────────────────────────────────
+# ── Dev (mirrors [project.optional-dependencies].dev) ─────────────────────────
 pytest==9.0.3
 pytest-cov==7.1.0
 ruff==0.15.13
 
-# ── Optional: Apple Silicon MLX backend ────────────────────────────────────────
-# Uncomment if you are on Apple Silicon and want --backend mlx (~16 tok/s)
+# ── Optional: lossless .swz shard codec — pip install swlp[codec] ─────────────
+# Off by default: a measured throughput LOSS above ~3.5 GB/s SSD read.
+# zipnn==0.5.4
+
+# ── Optional: Apple Silicon MLX backend — pip install swlp[apple] ─────────────
 # mlx==0.31.2
 # mlx-lm==0.31.3
 
-# ── Optional: NVIDIA VRAM tracking ─────────────────────────────────────────────
-# Uncomment if you have an NVIDIA GPU and want VRAM usage reported
-# pynvml>=11.5
-
-# ── Install SWLP itself in editable mode ───────────────────────────────────────
+# ── Install SWLP itself in editable mode ──────────────────────────────────────
 -e .

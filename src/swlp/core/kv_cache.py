@@ -209,7 +209,7 @@ class KVCacheManager:
 
         uncompressed = self._estimate_size(tensors)
         location = "host"
-        if tensors is not None and tensors[0].is_cuda:
+        if tensors is not None and tensors[0].device.type != "cpu":
             location = "device"
 
         entry = _KVEntry(
@@ -451,24 +451,37 @@ class KVCacheManager:
         }
 
     def clear(self) -> None:
-        """Clear all cached entries; delete any spill files."""
+        """Clear all cached entries; delete spill files; reset counters.
+
+        Peaks and op counters are reset too — a cleared manager must read as
+        virgin in ``stats()`` (mixing lifetimes silently corrupts reports).
+        Spill-file deletion failures are logged, not swallowed.
+        """
+        for entry in self._entries.values():
+            if entry.disk_path:
+                try:
+                    Path(entry.disk_path).unlink(missing_ok=True)
+                except Exception:
+                    LOGGER.exception("kv_spill_unlink_failed",
+                                     extra={"path": str(entry.disk_path)})
+        self._entries.clear()
+        self._device_bytes = 0
+        self._host_bytes = 0
+        self._compressed_bytes = 0
+        self._disk_bytes = 0
+        self._peak_device_bytes = 0
+        self._peak_host_bytes = 0
+        self._peak_total_bytes = 0
+        self._compressions = 0
+        self._decompressions = 0
+        self._offloads = 0
+        self._moves_to_device = 0
+        self._disk_spills = 0
+        self._disk_loads = 0
+        self._budget_violations = 0
+        self._history.clear()
         try:
-            # Clean up disk spill files.
-            for entry in self._entries.values():
-                if entry.disk_path:
-                    try:
-                        Path(entry.disk_path).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-            self._entries.clear()
-            self._device_bytes = 0
-            self._host_bytes = 0
-            self._compressed_bytes = 0
-            self._disk_bytes = 0
-            try:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
+            if hasattr(torch, "mps") and torch.backends.mps.is_available():
+                torch.mps.empty_cache()
         except Exception:
-            return
+            LOGGER.exception("kv_empty_cache_failed")
