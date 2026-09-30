@@ -47,9 +47,12 @@ pyrightconfig.json
 *.swo
 *~
 .project
-# Track the contributor operating manual; ignore any local Claude Code state.
-.claude/*
-!.claude/CLAUDE.md
+# AI-assistant working files (agent instructions, local state) and the
+# internal development log stay local — not part of the public repository.
+.claude/
+AGENTS.md
+docs/ROADMAP.md
+docs/formats.md
 .classpath
 .settings/
 *.sublime-project

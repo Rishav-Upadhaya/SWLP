@@ -102,37 +102,95 @@ Every backend returns the same `RunResult` (`prompt`, `completion`, `metrics`).
 
 ## Supported models and backends
 
-`swlp models` lists the built-in aliases; any Hugging Face model ID also works.
+`swlp models` lists the built-in aliases (and what is installed); any Hugging Face model ID also works.
 
 | Family | Aliases |
 |---|---|
+| MoE | `gemma4-26b` (4-bit MLX), `qwen3.6-35b`, `qwen3-30b-a3b`, `olmoe-7b`, `mixtral-8x7b`, `deepseek-v4-flash` |
 | Qwen2.5 | `qwen-0.5b`, `qwen-1.5b`, `qwen-3b`, `qwen-7b`, `qwen-14b` |
 | Mistral | `mistral-7b`, `mistral-24b` |
 | Others | `phi-3.5`, `smollm-360m`, `smollm-1.7b`, `tiny-gpt2` |
-| MoE | `qwen3-30b-a3b`, `mixtral-8x7b`, `deepseek-v4-flash` |
 
-Streaming supports Llama/Mistral/Qwen-style decoders, GPT-2, Qwen3.5-style hybrid (Gated DeltaNet) models, and MoE models (only routed experts are read per token).
+Streaming supports Llama/Mistral/Qwen-style decoders, GPT-2, Qwen3.5/3.8-style hybrid (Gated DeltaNet) models, and MoE models (only routed experts are read per token). Block-FP8 releases are dequantized to bf16 at pull time.
 
 | Backend | What it does |
 |---|---|
-| `swlp` | FP16/BF16 layer streaming from a shard directory |
-| `speculative` | `swlp` plus draft verification in one disk sweep (n-gram, `--draft-model`, or `--mtp`); lossless |
-| `mlx` | Model fully resident in MLX (`--quant bf16`, `int8`, `int4`) for interactive speed when it fits |
-| `mlx-moe` | MoE on MLX: dense weights resident, experts streamed through an LFU cache |
+| `swlp` | FP16/BF16 layer streaming from a shard directory; lossless |
+| `speculative` | `swlp` plus draft verification in one disk sweep (n-gram, `SWLP_DRAFT_MODEL`, or the checkpoint's MTP head automatically); output identical to `swlp` |
+| `mlx` | Model fully resident on MLX (`-q bf16`, `int8`, `int4`) for interactive speed when it fits |
+| `mlx-moe` | MoE on MLX: dense weights resident, experts streamed through an LFU cache; MoE shards or MLX checkpoints |
 | `hf` | Plain Hugging Face `transformers` full load (model must fit in RAM) |
 | `mock` | Deterministic offline responses for tests and CI |
 
-## How it works
+## Architecture
 
+### System overview
+
+You name a model; SWLP resolves it to a backend and a runner. Every runner returns the same
+`RunResult`, so the CLI, the OpenAI-compatible server and the Python API share one path.
+
+```mermaid
+flowchart LR
+    U["swlp chat / run / serve / bench"] --> R["cli_resolve<br/>model → backend"]
+    R -->|"MoE shards or MLX MoE checkpoint"| MOE["mlx-moe<br/>MlxMoeRunner"]
+    R -->|"dense shards"| SW["swlp / speculative<br/>SWLPRunner"]
+    R -->|"-q int4 · int8 · bf16"| MLX["mlx<br/>MlxRunner"]
+    R -->|"--backend hf"| HF["hf<br/>HuggingFaceRunner"]
+    MOE --> RES["RunResult<br/>completion + RunMetrics"]
+    SW --> RES
+    MLX --> RES
+    HF --> RES
+    subgraph DISK["NVMe SSD"]
+        SH["shards/&lt;model&gt;<br/>layer_NNN.safetensors<br/>expert banks · mtp head"]
+        CK["HF cache<br/>MLX checkpoints"]
+    end
+    SH -.-> SW
+    SH -.-> MOE
+    CK -.-> MOE
+    CK -.-> MLX
 ```
-NVMe SSD --[prefetch workers]--> unified RAM window (W layers) --> MPS compute
-    ^                                                                  |
-    +------------- evict layer, prefetch layer i+W <-------------------+
 
-Always resident: embeddings, final norm, LM head, KV cache
+### Layer streaming (`swlp`, `speculative`)
+
+A transformer computes one layer at a time, so only a window of W layers must be in memory.
+Worker threads read the next layers from SSD while the current one computes; the first N layers
+can stay resident (`--resident`), and embeddings, final norm, LM head and KV cache are always
+resident.
+
+```mermaid
+flowchart LR
+    SSD[("NVMe SSD<br/>per-layer shards")] -->|"prefetch reads<br/>(depth 2)"| BUF["reusable CPU buffers<br/>zero-copy tensors"]
+    BUF -->|"upload"| WIN["GPU window<br/>W layers (default 2)"]
+    RESL["resident layers<br/>first N · --resident"] --> CMP
+    WIN --> CMP["compute layer i"]
+    CMP -->|"evict i · prefetch i+W"| WIN
+    CMP --> LM["norm → LM head → next token"]
 ```
 
-Per-layer shards are read into reusable buffers by a worker pool and exposed as zero-copy tensors; the compute thread only swaps pointers. With W=2 about two layers are live at a time, so Mistral-7B streams in ~1.2 GB. Speculative decoding amortises each full disk sweep over several verified tokens. Details: [docs/architecture.md](https://github.com/Rishav-Upadhaya/SWLP/blob/main/docs/architecture.md).
+Throughput is bounded by `SSD bandwidth / bytes read per token`. Speculative decoding breaks
+that bound by verifying several drafted tokens in one sweep: a resident draft model, n-gram
+lookup, or the checkpoint's own MTP head. For hybrid Gated-DeltaNet models the recurrent state
+is rolled back exactly when drafts are rejected, so output stays identical.
+
+### MoE expert streaming (`mlx-moe`)
+
+A mixture-of-experts layer only uses its top-k routed experts per token. SWLP keeps every
+non-expert weight resident and treats the experts as a cache backed by per-layer expert banks.
+
+```mermaid
+flowchart LR
+    X["hidden state"] --> RT["router: top-k experts"]
+    RT --> C{"LFU expert cache<br/>(budget = free RAM,<br/>capped by GPU memory)"}
+    C -->|"hit"| E["expert compute<br/>(MLX, bf16 or packed 4/8-bit)"]
+    C -->|"miss"| RD["parallel pread of the<br/>whole expert (F_NOCACHE)"]
+    RD --> BK[("expert banks on SSD<br/>or MLX checkpoint")]
+    RD --> E
+    E --> Y["weighted sum → next layer"]
+```
+
+LFU instead of LRU matters: a decode step sweeps every layer's experts in order, so LRU evicts
+each expert just before it is reused (0% hits at small caches on real routing traces).
+Details for all of the above: [docs/architecture.md](https://github.com/Rishav-Upadhaya/SWLP/blob/main/docs/architecture.md).
 
 ## Documentation
 
@@ -140,10 +198,8 @@ Per-layer shards are read into reusable buffers by a worker pool and exposed as 
 |---|---|
 | [Configuration](https://github.com/Rishav-Upadhaya/SWLP/blob/main/docs/configuration.md) | Backends, CLI flags, `SWLP_*` environment variables, TOML profiles |
 | [Architecture](https://github.com/Rishav-Upadhaya/SWLP/blob/main/docs/architecture.md) | Streaming pipeline, schedulers, KV tiers, MoE expert cache |
-| [Formats](https://github.com/Rishav-Upadhaya/SWLP/blob/main/docs/formats.md) | Shard directory, expert banks, `.swz` codec, package format |
 | [Benchmarking](https://github.com/Rishav-Upadhaya/SWLP/blob/main/docs/benchmarking.md) | Methodology and how to reproduce the numbers |
 | [Results](https://github.com/Rishav-Upadhaya/SWLP/blob/main/docs/results.md) | All measured numbers |
-| [Roadmap](https://github.com/Rishav-Upadhaya/SWLP/blob/main/docs/ROADMAP.md) | Project history and open work |
 | [Changelog](https://github.com/Rishav-Upadhaya/SWLP/blob/main/CHANGELOG.md) | Release notes |
 
 The TOML profiles in `configs/` and the tools in `scripts/` (hardware check, benchmark harnesses) live in the repository only; they are not part of the installed package.
@@ -153,7 +209,7 @@ The TOML profiles in `configs/` and the tools in `scripts/` (hardware check, ben
 - **Apple Silicon only.** The CUDA/NVIDIA path was removed; Linux and Windows are unsupported.
 - **Streaming is slow by design.** It makes oversized models feasible; it does not make them interactive. Throughput is capped at SSD bandwidth divided by bytes per token (about 0.5 tok/s for Mistral-7B FP16 on a 6.9 GB/s SSD). If a model fits in memory, `mlx` is far faster.
 - **The `.swz` codec saves ~31% disk but is slower on fast SSDs.** Decompression competes for unified-memory bandwidth; it only helps below roughly 3.5 GB/s read speed. Plain shards stay the default.
-- **Lossy tiers are opt-in and off by default:** MLX `int8`/`int4` weights, MLX KV quantization (`--kv-bits`), INT4 KV (`--kv-quant int4`), and `--max-kv-size`.
+- **Lossy tiers are opt-in and off by default:** MLX `int8`/`int4` weights (`-q`), MoE quantize-on-load (`-q int4|int8` on MoE shards), MLX KV quantization (`SWLP_MLX_KV_BITS`), INT4 KV (`SWLP_KV_QUANT=int4`), and a capped KV window (`SWLP_KV_WINDOW`).
 - Speculative speedups depend on how often drafts are accepted; n-gram drafting gives little on novel text.
 
 ## Citation

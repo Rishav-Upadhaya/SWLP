@@ -35,17 +35,14 @@ Write imperative commit messages (`Add expert-cache budget clamp`, not
 
 ## Conventions
 
-The full operating manual is
-[`.claude/CLAUDE.md`](https://github.com/Rishav-Upadhaya/SWLP/blob/main/.claude/CLAUDE.md).
 The essentials:
 
 - **No quality compromise.** Anything lossy must be opt-in, off by default, and
   clearly labelled.
 - **Layout and imports.** Runners go in `runner/` and register in
-  `build_runner()`, algorithms in `core/`, disk I/O in `model/`, reporters in
-  `reporting/`. `core/`, `hardware/` and `model/` must not import from
-  `runner/`, `benchmark/` or `reporting/` (`tests/test_architecture.py`
-  enforces this).
+  `build_runner()`, algorithms in `core/`, disk I/O in `model/`, terminal
+  output through `ui.py`. `core/`, `hardware/` and `model/` must not import
+  from `runner/` or `benchmark/` (`tests/test_architecture.py` enforces this).
 - **No hardcoded values.** Use `AppConfig`, TOML configs in `configs/`, and
   `SWLP_*` environment variables. A config field with no consumer is not allowed.
 - **Logging, not `print()`,** for runtime output (`configure_logging()`);

@@ -2,7 +2,7 @@
 
 All measured SWLP numbers are collected here. Unless a row says otherwise, the machine is an
 **Apple M5 with 16 GB unified memory** (LPDDR5X, 153 GB/s) and the decoding is greedy. Phase
-numbers point to the matching entries in [ROADMAP.md](ROADMAP.md). For how the numbers were
+numbers name the development stage a number was measured in. For how the numbers were
 measured, see [benchmarking.md](benchmarking.md).
 
 ## How to read these numbers
@@ -28,11 +28,11 @@ measured, see [benchmarking.md](benchmarking.md).
 | Mistral-7B FP16 | AirLLM 2.11.0 | 0.085 | Warm, same harness and prompts as the 0.210 row |
 | Qwen2.5-14B FP16 (26.4 GB) | `swlp`, W=2 | 0.187–0.197 | Direct I/O, after Phase 20 |
 | Qwen2.5-14B FP16 | `speculative` + Qwen2.5-0.5B draft | **0.545–1.158** | Direct I/O. Depends on acceptance. Output identical. |
-| Qwen3.8-27B fp16 (48.7 GB) | `speculative --mtp` | 0.498 | 8–24 tokens. Output identical. |
+| Qwen3.8-27B fp16 (48.7 GB) | `speculative` + MTP head | 0.498 | 8–24 tokens. Output identical. |
 | Mistral-Small-24B FP16 (~44 GB) | `swlp`, W=2 | 0.081 | Warm, before Phase 20, 3.76 GB peak RAM |
-| Mistral-7B | `mlx --quant int8` | 16.0 | Byte-identical to FP16 |
-| Mistral-7B | `mlx --quant int4` | 27.9 | Lossy |
-| Qwen2.5-14B | `mlx --quant int4` | 13.8 | Lossy. int8 runs out of memory. |
+| Mistral-7B | `mlx -q int8` | 16.0 | Byte-identical to FP16 |
+| Mistral-7B | `mlx -q int4` | 27.9 | Lossy |
+| Qwen2.5-14B | `mlx -q int4` | 13.8 | Lossy. int8 runs out of memory. |
 | Gemma 4 26B A4B, 4-bit (15.3 GB) | `mlx-moe` | 14.5 | Steady state, 95% expert hits. Stock mlx_lm runs out of memory. |
 | Qwen3.6-35B-A3B BF16 (66 GB) | `mlx-moe` | 4.4–5.0 | Steady state. About 5 tok/s is the BF16 ceiling on 16 GB. |
 
@@ -74,9 +74,8 @@ rows should be quoted.
 | 0.218 → **0.372** | 2026-06-11, Phase 20 | Direct I/O, 8 tokens, median of 3 (0.360 / 0.372 / 0.379). Prefill 5.86 → 2.30 s. RAM 1.17 GB. | Current |
 | 0.390 | 2026-06-11, Phase 22 | Direct I/O, W=4, prefetch depth 2, 6-token probe | Current |
 
-The 0.174 cold run is recorded in the paper notes (`research/research.md`, Table VI). ROADMAP
-Phase 19 still lists the cold run as pending. The same cold measurement hasn't been repeated
-since Phase 20.
+The 0.174 figure is a cold-cache run from the paper notes (Table VI); that cold measurement
+hasn't been repeated since Phase 20.
 
 ### Window size (Phase 1, 16 tokens)
 
@@ -196,7 +195,7 @@ Mistral-7B has no small draft model with the same tokenizer.
 | Baseline defaults, before the fix (10 GB footprint, swapping) | 0.035 |
 | Window 1, prefetch 1, residency off | 0.100 |
 | Defaults with the embedding kept on CPU via mmap (8.4 GB peak) | 0.135 |
-| `--mtp`, max draft 2 / 4 / 16 | 0.339 / 0.461 / **0.498** |
+| MTP, max draft 2 / 4 / 16 | 0.339 / 0.461 / **0.498** |
 
 Output is identical to plain decoding. Splitting shard reads into 2 parallel `pread` calls made
 the pipeline 3× slower, even though it was faster in isolation.
@@ -219,10 +218,10 @@ fully loaded on this machine.
 
 | Model | Backend | tok/s | Completion vs FP16 |
 |---|---|---:|---|
-| Mistral-7B | `mlx --quant int8` | **16.0** | Byte-identical |
-| Mistral-7B | `mlx --quant int4` | 27.9 | Minor wording drift |
-| Qwen2.5-14B | `mlx --quant int8` | — | Out of memory (~14 GB) |
-| Qwen2.5-14B | `mlx --quant int4` | **13.8** | Minor wording drift |
+| Mistral-7B | `mlx -q int8` | **16.0** | Byte-identical |
+| Mistral-7B | `mlx -q int4` | 27.9 | Minor wording drift |
+| Qwen2.5-14B | `mlx -q int8` | — | Out of memory (~14 GB) |
+| Qwen2.5-14B | `mlx -q int4` | **13.8** | Minor wording drift |
 
 MLX RAM figures come from psutil RSS, which under-reports wired Metal memory.
 
@@ -306,17 +305,17 @@ been removed, and loading an FP8 manifest raises an error.
 On Mistral-7B, lossless zlib compression of the KV cache gives only about 1.10× (level 1:
 1.104× at 29.0 s; level 9: 1.108× at 37.0 s), because FP16 activations are high-entropy.
 Completions are identical and generation is about 3% slower. The zlib tier is useful for
-offloading cold layers to host RAM, not for its compression ratio. INT4 KV (`--kv-quant int4`)
+offloading cold layers to host RAM, not for its compression ratio. INT4 KV (`SWLP_KV_QUANT=int4`)
 is about 4× smaller, but its perplexity cost has not been measured yet.
 
 ## Simulation vs end to end
 
-`swlp simulate` and `scripts/research/simtools` model only the scheduling pipeline: read,
+The simulators in `scripts/research/simtools` model only the scheduling pipeline: read,
 deserialize, upload, compute and evict. They leave out attention, KV bookkeeping, Python,
 Metal dispatch and synchronization, so real tok/s comes in well below the simulated value. Use
 the simulators to compare scheduling strategies, not to predict absolute throughput.
 
-The `swlp suite` tooling is validated on tiny-gpt2 (`benchmarks/suite-20260520T044433Z.json`),
+The suite tooling (`swlp.benchmark.suite`) is validated on tiny-gpt2 (`benchmarks/suite-20260520T044433Z.json`),
 because the suite's full-model HF baseline can't load Mistral-7B on 16 GB.
 
 ## Pending measurements

@@ -100,9 +100,9 @@ swlp doctor mistral-7b          # pipeline ratio, predicted residency, confidenc
 **2. Shard the models.**
 
 ```bash
-swlp download --model mistral-7b    # ./shards/mistral-7b, 13.96 GB
-swlp download --model qwen-14b      # ./shards/qwen-14b
-swlp download --model qwen-0.5b     # draft model for speculative runs
+swlp pull mistral-7b    # ./shards/mistral-7b, 13.96 GB
+swlp pull qwen-14b      # ./shards/qwen-14b
+swlp pull qwen-0.5b     # draft model for speculative runs
 ```
 
 **3. Streaming throughput** (cold, same harness as AirLLM):
@@ -121,16 +121,13 @@ sudo .venv/bin/python scripts/research/phase3_baselines.py --baseline all --runs
 **5. Per-configuration CLI benchmarks.**
 
 ```bash
-SWLP_DIRECT_IO=on SWLP_STRICT=1 swlp benchmark --shard-dir ./shards/mistral-7b \
-    --window 2 --runs 5 --warmup-runs 1 --prompt-set short --report
-swlp --config configs/swlp_qwen_draft_mps.toml --prompt "List ten prime numbers."   # draft-model speculation
-swlp benchmark --shard-dir ./shards/mistral-7b --batch-size 8 --runs 3 --report     # batched streaming
-swlp suite --suite configs/bench_suite.toml --report
-swlp report benchmarks/baseline-<timestamp>.json
+SWLP_DIRECT_IO=on SWLP_STRICT=1 swlp bench mistral-7b --window 2 --runs 5    # median tok/s, TTFT, peak RAM
+SWLP_DRAFT_MODEL=qwen-0.5b swlp run qwen-14b "List ten prime numbers."        # draft-model speculation
+swlp bench mistral-7b --runs 5 --json > benchmarks/mistral-7b.json             # machine-readable summary
 ```
 
-`--window` takes one integer. To sweep windows, run once for each value, or use
-`swlp suite`.
+`--window` takes one integer; to sweep windows, run once per value. Batched streaming and
+prompt-set suites are library APIs (`SWLPRunner.run_batch`, `swlp.benchmark.suite.run_suite`).
 
 **6. Quality equivalence.** Check that streaming output matches the HF reference.
 
@@ -148,7 +145,6 @@ python scripts/research/moe_sweep.py --shard-dir ./shards/qwen3-30b-a3b \
 **8. Simulation and figures** (no model needed).
 
 ```bash
-swlp simulate --scenario configs/sim_m5.toml --report       # analytic bottleneck model
 python scripts/run_full_benchmark.py                        # discrete-event model × feature tables
 python -m scripts.research.simtools sim --layers 32 --layer-size-mb 436 --window 2 --prefetch 4 --report
 python scripts/generate_figures.py --output-dir figures/
@@ -157,8 +153,8 @@ python scripts/generate_figures.py --output-dir figures/
 **9. Profiling a slow run.**
 
 ```bash
-swlp profile --shard-dir ./shards/mistral-7b --max-tokens 8 --output traces.json --summary
-python -m scripts.research.simtools analyze traces.json
+SWLP_PROFILE=1 swlp run mistral-7b "Hi" -n 8    # per-layer timeline + summary; writes layer_traces.json
+python -m scripts.research.simtools analyze layer_traces.json
 ```
 
 Raw outputs go to `benchmarks/` (CLI and harness JSON), `experiments/` (sweeps and

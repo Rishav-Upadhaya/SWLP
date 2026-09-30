@@ -11,7 +11,7 @@ Output is **bit-identical to greedy SWLP** — every drafted token is greedily
 verified; speculation changes throughput only. Rejected tokens are rolled back
 with ``DynamicCache.crop()``, or for hybrid Gated-DeltaNet caches by exact
 state recomputation (``hybrid_rollback.py``). KV compression (Phase 2) is
-mutually exclusive with this path — see the Phase 5 appendix of ``docs/ROADMAP.md``.
+mutually exclusive with this path: its compressed cache cannot be cheaply rolled back.
 """
 from __future__ import annotations
 
@@ -227,8 +227,8 @@ class SpeculativeRunner(SWLPRunner):
         drafter = self._build_drafter()
         if isinstance(drafter, MtpDrafter):
             # Prefill states pair with the token that follows each position.
-            # ponytail: chunked prefill only leaves the last chunk's states
-            # here, so the MTP head sees a shorter history (acceptance only).
+            # Known limit: chunked prefill only leaves the last chunk's states
+            # here, so the MTP head sees a shorter history (affects acceptance only).
             prefill = adapter.final_norm(self.model, ctx.hidden_states)
             drafter.extend(prefill, generated[0, -int(prefill.shape[1]):].tolist())
         max_new = int(self.config.generation.max_new_tokens)

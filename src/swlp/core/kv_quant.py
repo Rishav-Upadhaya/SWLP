@@ -21,7 +21,7 @@ lookups.
 
 Expected error:  relative L1 error ≈ 0.5–2% on typical transformer KV
 activations.  Perplexity delta is workload-dependent but typically < 1 ppl
-for medium-length context (see Phase 18 notes in CLAUDE.md).
+for medium-length context.
 """
 from __future__ import annotations
 

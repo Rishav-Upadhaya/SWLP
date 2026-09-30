@@ -2,7 +2,7 @@
 
 SWLP runs a transformer one layer at a time and streams the weights from SSD, so only a window
 of `W` layers is in memory at any moment. This page covers how that path is built. For settings,
-see [configuration.md](configuration.md). For on-disk layouts, see [formats.md](formats.md).
+see [configuration.md](configuration.md).
 
 ## Package layout
 
@@ -116,13 +116,13 @@ pipeline ratio = (SSD read + deserialize + upload) / block compute
 
 ## Profiling
 
-`swlp profile` (or `--profile`) attaches a `LayerProfiler` (`core/profiler.py`) that timestamps
+Profiling (`SWLP_PROFILE=1`) attaches a `LayerProfiler` (`core/profiler.py`) that timestamps
 every stage of every layer: `read`, `deserialize`, `upload`, `ready`, `compute` and `evict`. It
 exports a JSON trace with hardware metadata:
 
 ```bash
-swlp profile --shard-dir ./shards/mistral-7b --max-tokens 8 --output traces.json --summary
-python -m scripts.research.simtools analyze traces.json
+SWLP_PROFILE=1 swlp run mistral-7b "Hi" -n 8        # writes layer_traces.json
+python -m scripts.research.simtools analyze layer_traces.json
 ```
 
 The measured per-layer stages for Mistral-7B on M5 were: read about 120 ms (SSD-limited) and
@@ -138,8 +138,8 @@ single disk sweep. Verification is greedy, so the output is identical to plain g
 | Drafter | Module | Selected by |
 |---|---|---|
 | N-gram prompt lookup (multi-resolution) | `core/speculative.py::NgramDrafter` | default |
-| Resident small model (same tokenizer) | `runner/draft.py::DraftModelDrafter` | `--draft-model` |
-| Checkpoint MTP head | `runner/mtp.py` | `--mtp` |
+| Resident small model (same tokenizer) | `runner/draft.py::DraftModelDrafter` | `SWLP_DRAFT_MODEL` |
+| Checkpoint MTP head (dense models) | `runner/mtp.py` | automatic when `mtp.safetensors` exists |
 
 Draft length adapts to acceptance (AIMD). For hybrid Gated-DeltaNet models, which cannot be
 rolled back with `DynamicCache.crop()`, `runner/hybrid_rollback.py` replays only the accepted

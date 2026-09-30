@@ -84,7 +84,7 @@ def read_shard_mmap(path: Path) -> tuple[torch.Tensor, int]:
         size = os.fstat(f.fileno()).st_size
         mm = mmap.mmap(f.fileno(), size, access=mmap.ACCESS_READ)
         _madvise_willneed(mm, size)
-    # ponytail: attach handle so the mapping outlives parsed views.
+    # Attach the handle so the mapping outlives the parsed tensor views.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # read-only buffer is the point of mmap
         payload = torch.frombuffer(mm, dtype=torch.uint8)

@@ -193,7 +193,7 @@ class LlamaLikeAdapter:
 
         # Hybrid models (qwen3_5: Gated-DeltaNet + full attention) need the
         # config-structured cache — linear-attention layers hold conv/recurrent
-        # state, not K/V. ponytail: batched (N>1) streaming unverified for these.
+        # state, not K/V. Batched (N>1) streaming is not yet verified for these.
         if "linear_attention" in (getattr(model.config, "layer_types", None) or ()):
             return DynamicCache(config=model.config)
         # Plain DynamicCache() — grows dynamically and handles any batch size.

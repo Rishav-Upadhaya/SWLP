@@ -5,30 +5,26 @@ setting, its TOML key, its `SWLP_*` environment variable, and its default.
 
 ## Backends
 
+You normally never choose a backend: name a model and SWLP picks one. `swlp chat MODEL -d`
+shows the choice, which other backends can run that model, and the chosen backend's settings.
+
 | Backend | Runner | Use it for |
 |---|---|---|
-| `hf` | `HuggingFaceRunner` | Full-model load with transformers. Only for models that fit in RAM. |
 | `swlp` | `SWLPRunner` | FP16/BF16 layer streaming from a shard directory. Lossless; works for models larger than RAM. |
-| `speculative` | `SpeculativeRunner` | `swlp` plus speculative decoding: n-gram prompt lookup, a resident draft model (`--draft-model`), or the checkpoint's MTP head (`--mtp`). Output is identical to greedy `swlp`. |
-| `mlx` | `MlxRunner` | Native MLX compute for models that fit in RAM. `--quant bf16` (lossless), `int8` (default), or `int4` (lossy). Needs `swlp[apple]`. |
-| `mlx-moe` | `MlxMoeRunner` | MLX Mixture-of-Experts with dense weights resident and experts streamed through a cache. Accepts a shard directory or an MLX-format checkpoint. Needs `swlp[apple]`. |
+| `speculative` | `SpeculativeRunner` | `swlp` plus speculative decoding: n-gram prompt lookup, a resident draft model (`SWLP_DRAFT_MODEL`), or the checkpoint's MTP head (used automatically when present). Output is identical to greedy `swlp`. |
+| `mlx` | `MlxRunner` | Native MLX compute for models that fit in RAM: `-q bf16` (lossless), `int8`, or `int4` (lossy). Needs `swlp[apple]`. |
+| `mlx-moe` | `MlxMoeRunner` | Mixture-of-Experts on MLX: dense weights resident, experts streamed through an LFU cache. Runs pulled MoE shards (`-q int4|int8` quantizes on load) or MLX-format checkpoints. Needs `swlp[apple]`. |
+| `hf` | `HuggingFaceRunner` | Full-model load with transformers. Only for models that fit in RAM. |
 | `mock` | `MockRunner` | Deterministic offline output with no model. Use it for tests and smoke checks. |
 
-If you don't pass `--backend`, the CLI picks one in this order:
+The automatic choice (`src/swlp/cli_resolve.py`), first match wins:
 
-1. `--quant` is set: `mlx`.
-2. `--shard-dir` (or `runtime.shard_dir`) is set: `speculative` if a draft model or `--mtp` is
-   also configured, otherwise `swlp`.
-3. Otherwise the configured `runtime.backend` (default `hf`).
-
-`swlp run` and `swlp serve` shard the model into `./shards/<name>` on first use, but only when
-the backend they resolve to is `swlp` or `speculative`. For example:
-
-```bash
-swlp run mistral-7b --backend swlp --prompt "Hi"
-```
-
-With the default `hf` backend, nothing is sharded.
+1. `--backend NAME` is given: that backend.
+2. The model is a pulled shard directory (`shards/<name>` or a path): `mlx-moe` if it has expert
+   banks, `speculative` if it has an MTP head, otherwise `swlp`.
+3. The model is a local or Hub MLX-format checkpoint: `mlx-moe` for MoE models, otherwise `mlx`.
+4. `-q` is given: `mlx` at that precision (refused up front if it cannot fit the GPU memory).
+5. Anything else must be pulled first: `swlp pull MODEL`.
 
 ## Precedence
 
@@ -54,9 +50,12 @@ wheel. After `pip install swlp`, pass your own file with `--config` or use envir
 variables.
 
 ```bash
-SWLP_WINDOW_SIZE=1 SWLP_DIRECT_IO=on swlp --shard-dir ./shards/mistral-7b --prompt "Hi"
-swlp --config my.toml --prompt "Hi"          # flags still override the file
+SWLP_WINDOW_SIZE=1 SWLP_DIRECT_IO=on swlp run mistral-7b "Hi"
+swlp chat mistral-7b --config my.toml        # flags still override the file
 ```
+
+CLI flags cover the common settings: `-q/--quant`, `-n/--max-tokens`, `--resident`,
+`--window`, `--backend` and `--config`. Everything else is a `SWLP_*` variable or a TOML key.
 
 ## TOML layout
 
@@ -71,7 +70,7 @@ swlp --config my.toml --prompt "Hi"          # flags still override the file
 
 | Key | Env var | Default | Meaning |
 |---|---|---|---|
-| `model_id` | `SWLP_MODEL_ID` | `sshleifer/tiny-gpt2` | Hugging Face id or alias. With `--shard-dir` and no `--model`, SWLP reads it from the shard manifest. |
+| `model_id` | `SWLP_MODEL_ID` | `sshleifer/tiny-gpt2` | Hugging Face id or alias. For a pulled shard directory SWLP reads it from the shard manifest. |
 | `local_model_path` | `SWLP_MODEL_PATH` † | unset | Load from this local directory instead of `model_id`. |
 | `trust_remote_code` | `SWLP_TRUST_REMOTE_CODE` | `false` | Passed to transformers. |
 | `revision` | `SWLP_REVISION` | unset | Hub revision (branch, tag, or commit). |
@@ -87,13 +86,13 @@ swlp --config my.toml --prompt "Hi"          # flags still override the file
 
 | Key | Env var | Default | Meaning |
 |---|---|---|---|
-| `max_new_tokens` | `SWLP_MAX_NEW_TOKENS` | `32` | Tokens to generate (`--max-tokens`). |
+| `max_new_tokens` | `SWLP_MAX_NEW_TOKENS` | `32` | Library default. The CLI instead runs until the model finishes its answer unless `-n/--max-tokens` caps it. |
 | `temperature` | `SWLP_TEMPERATURE` | `0.0` | Sampling temperature. |
 | `top_p` | `SWLP_TOP_P` | `1.0` | Nucleus sampling. |
 | `do_sample` | `SWLP_DO_SAMPLE` | `false` | `false` means greedy decoding. |
 | `repetition_penalty` | `SWLP_REPETITION_PENALTY` | `1.0` | 1.0 disables the penalty. |
 | `seed` | `SWLP_SEED` | `42` | RNG seed. |
-| `prompt` | `SWLP_PROMPT` | a welcome-message prompt | Default prompt when you don't pass `--prompt`. |
+| `prompt` | `SWLP_PROMPT` | a welcome-message prompt | Default prompt for library use (`runner.run()` with no prompt). |
 
 ### `[runtime]`: general
 
@@ -113,11 +112,11 @@ swlp --config my.toml --prompt "Hi"          # flags still override the file
 
 | Key | Env var | Default | Meaning |
 |---|---|---|---|
-| `shard_dir` | `SWLP_SHARD_DIR` | unset | Shard directory (`--shard-dir`). Selects streaming. |
+| `shard_dir` | `SWLP_SHARD_DIR` | unset | Shard directory. The CLI sets it for pulled models; selects streaming. |
 | `swlp_window_size` | `SWLP_WINDOW_SIZE` | `2` | Layers materialized at once (`--window`). |
 | `swlp_prefetch_depth` | `SWLP_PREFETCH_DEPTH` | `2` | Prefetch lookahead. The effective lookahead is `max(window, depth)`. |
 | `swlp_prefetch` | `SWLP_PREFETCH` | `true` | Background prefetch on or off. |
-| `swlp_residency` | `SWLP_RESIDENCY` | `auto` | Layers held in CPU RAM: `auto` (planner decides), `off`, or an integer. |
+| `swlp_residency` | `SWLP_RESIDENCY` | `auto` | The first N layers kept in RAM (`--resident`): `auto` (planner decides), `off`, or an integer. The CLI refuses a count that free RAM cannot hold. |
 | `swlp_direct_io` | `SWLP_DIRECT_IO` | `auto` | `on` bypasses the page cache (`F_NOCACHE`). `off` uses it. `auto` bypasses only when the model is larger than 60% of available RAM. |
 | `swlp_shard_volumes` | `SWLP_SHARD_VOLUMES` | `""` | Comma-separated extra shard directories. Layers are striped round-robin across them. |
 | `swlp_prefill_chunk` | `SWLP_PREFILL_CHUNK` | `0` | Prefill the prompt in chunks of N tokens. 0 means one sweep. Lossless. |
@@ -150,15 +149,15 @@ swlp --config my.toml --prompt "Hi"          # flags still override the file
 
 | Key | Env var | Default | Meaning |
 |---|---|---|---|
-| `mlx_quant` | `SWLP_MLX_QUANT` | `int8` | `bf16`, `int8` or `int4` (`--quant`). |
+| `mlx_quant` | `SWLP_MLX_QUANT` | `int8` | `bf16`, `int8` or `int4` (`-q`). |
 | `mlx_wired_limit` | `SWLP_MLX_WIRED_LIMIT` | `auto` | Metal wired-memory ceiling: `auto`, `off`, or a size in MB. Clamped to Metal's recommended working set. |
-| `mlx_kv_bits` | `SWLP_MLX_KV_BITS` | `0` | KV quantization: `0` (off), `4` or `8` (`--kv-bits`). |
+| `mlx_kv_bits` | `SWLP_MLX_KV_BITS` | `0` | KV quantization: `0` (off), `4` or `8`. |
 | `mlx_kv_group_size` | `SWLP_MLX_KV_GROUP_SIZE` | `64` | KV quantization group size. |
 | `mlx_quantized_kv_start` | `SWLP_MLX_QUANTIZED_KV_START` | `512` | Keep the first N tokens of KV exact. |
 | `mlx_num_draft_tokens` | `SWLP_MLX_NUM_DRAFT_TOKENS` | `4` | Draft tokens per speculative step (`--draft-tokens`). |
 | `mlx_prefill_step_size` | `SWLP_MLX_PREFILL_STEP` † | `2048` | Prefill chunk size. |
 | `mlx_prompt_cache` | `SWLP_MLX_PROMPT_CACHE` | `true` | Reuse prefix KV across chat turns. |
-| `mlx_draft_model` | `SWLP_MLX_DRAFT_MODEL` | `""` | MLX draft model. `--draft-model` sets both this and `swlp_draft_model`. |
+| `mlx_draft_model` | `SWLP_MLX_DRAFT_MODEL` | `""` | MLX draft model (same tokenizer as the target). |
 
 ### `[runtime]`: MoE expert streaming
 
@@ -166,6 +165,7 @@ swlp --config my.toml --prompt "Hi"          # flags still override the file
 |---|---|---|---|
 | `swlp_expert_cache_mb` | `SWLP_EXPERT_CACHE_MB` | `0` | Expert-cache budget. With `0`, torch uses a quarter of available RAM (capped at 4 GB) and `mlx-moe` uses free RAM clamped to the Metal working set. |
 | `swlp_expert_prefetch` | `SWLP_EXPERT_PREFETCH` | `lru` | `lru`, `predictive` or `off`. Predictive measured slower on M5. |
+| `swlp_moe_quant` | `SWLP_MOE_QUANT` | `none` | MoE shards only: `int8` or `int4` quantizes on load (dense once, experts as they are cached; lossy). `-q` sets it. |
 
 † The variable name doesn't follow the `SWLP_<FIELD>` rule.
 

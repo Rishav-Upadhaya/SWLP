@@ -47,8 +47,8 @@ MOE_MODELS: dict[str, dict[str, object]] = {
     "deepseek-v4-flash": {"disk_gb": 142.0, "precision": "mxfp4", "prepared": False},
 }
 
-# Steady-state decode measured on an Apple M5 16 GB (docs/ROADMAP.md,
-# Phases 29–31). Everything else shows "—": no guesses in this table.
+# Steady-state decode measured on an Apple M5 16 GB (docs/results.md).
+# Everything else shows "—": no guesses in this table.
 MEASURED_M5_16GB: dict[str, str] = {
     "gemma4-26b": "14.5",
     "olmoe-7b": "12.5",

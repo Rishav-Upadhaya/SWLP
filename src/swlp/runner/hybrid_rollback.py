@@ -86,7 +86,7 @@ def _modeling_module(model: nn.Module) -> ModuleType:
 def record_linear_attention(model: nn.Module) -> Iterator[LinearStateRecord]:
     """Record every linear layer's conv / delta-rule inputs inside the block.
 
-    Not thread-safe: the wrapped functions are module globals. ponytail: fine
+    Not thread-safe: the wrapped functions are module globals. That is fine
     while blocks compute on one thread (scheduler threads only load weights).
     """
     module = _modeling_module(model)
