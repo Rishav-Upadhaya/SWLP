@@ -124,11 +124,16 @@ class BenchmarkRecord:
         return asdict(self)
 
 
-def default_benchmark_path(format: str) -> Path:
+def timestamped_path(directory: str, prefix: str, format: str) -> Path:
+    """``<directory>/<prefix>-<UTC timestamp>.<format>``, creating the directory."""
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    directory = Path("benchmarks")
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"baseline-{timestamp}.{format}"
+    path = Path(directory)
+    path.mkdir(parents=True, exist_ok=True)
+    return path / f"{prefix}-{timestamp}.{format}"
+
+
+def default_benchmark_path(format: str) -> Path:
+    return timestamped_path("benchmarks", "baseline", format)
 
 
 @dataclass(slots=True)

@@ -94,30 +94,21 @@ def load_draft_model(
     return model, tokenizer
 
 
-class DraftModelDrafter:
-    """Greedy autoregressive token proposer backed by a resident draft model.
+class AdaptiveDraftLength:
+    """AIMD draft-length controller shared by the model-backed drafters.
 
-    Same ``propose(tokens) -> list[int]`` interface as ``NgramDrafter``. Drafts
-    are raw argmax picks — draft choices only affect the acceptance rate, never
-    correctness, since the target verifies every token.
-
-    Adaptive draft length: the caller reports each sweep's outcome via
-    ``observe(proposed, accepted)`` and the drafter adjusts K multiplicatively
-    (AIMD) — full acceptance doubles K, majority acceptance bumps it by one,
-    poor acceptance halves it (floor 1). On low-agreement text the per-sweep
-    drafting overhead therefore collapses to ~2 small-model forwards instead
-    of ``max_draft + 1``, capping the worst-case regression vs plain decoding,
-    while predictable text recovers the full draft depth within a few sweeps.
+    The caller reports each sweep's outcome via ``observe(proposed, accepted)``
+    and K adjusts multiplicatively — full acceptance doubles K, majority
+    acceptance bumps it by one, poor acceptance halves it (floor 1). On
+    low-agreement text the per-sweep drafting overhead collapses to ~2 small
+    forwards instead of ``max_draft + 1``, capping the worst-case regression
+    vs plain decoding, while predictable text recovers the full depth within
+    a few sweeps.
     """
 
-    def __init__(self, model: Any, device: torch.device, max_draft: int) -> None:
-        self._model = model
-        self._device = device
+    def __init__(self, max_draft: int) -> None:
         self._max_k = max(0, int(max_draft))
         self._k = self._max_k
-        self._cache: Any | None = None
-        # Token IDs whose KV the cache currently covers (in order).
-        self._cached_ids: list[int] = []
 
     @property
     def max_draft(self) -> int:
@@ -137,6 +128,25 @@ class DraftModelDrafter:
             self._k = min(self._k + 1, self._max_k)
         else:
             self._k = max(1, self._k // 2)
+
+
+class DraftModelDrafter(AdaptiveDraftLength):
+    """Greedy autoregressive token proposer backed by a resident draft model.
+
+    Same ``propose(tokens) -> list[int]`` interface as ``NgramDrafter``. Drafts
+    are raw argmax picks — draft choices only affect the acceptance rate, never
+    correctness, since the target verifies every token.
+
+    Adaptive draft length comes from ``AdaptiveDraftLength`` (AIMD).
+    """
+
+    def __init__(self, model: Any, device: torch.device, max_draft: int) -> None:
+        super().__init__(max_draft)
+        self._model = model
+        self._device = device
+        self._cache: Any | None = None
+        # Token IDs whose KV the cache currently covers (in order).
+        self._cached_ids: list[int] = []
 
     def propose(self, tokens: list[int]) -> list[int]:
         """Return up to K greedy draft tokens continuing ``tokens``.

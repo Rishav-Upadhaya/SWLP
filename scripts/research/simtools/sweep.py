@@ -4,7 +4,7 @@ Sweeps parameter ranges and produces structured datasets for analysis.
 No model or GPU required — pure simulation.
 
 Usage:
-    from swlp.core.sweep import SweepConfig, run_sweep
+    from scripts.research.simtools.sweep import SweepConfig, run_sweep
 
     results = run_sweep(
         SweepConfig(
@@ -29,8 +29,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .profiler import compute_pipeline_metrics
-from .simulator import SimResult, SimulatorConfig, simulate
+from scripts.research.simtools.simulator import SimResult, SimulatorConfig, simulate
+from swlp.core.profiler import compute_pipeline_metrics
 
 
 @dataclass
@@ -114,17 +114,17 @@ class SweepResult:
 
         for (nl, lsz), pts in groups.items():
             total_ram_needed = nl * lsz / 1024
-            print(f"\n{'='*100}")
+            print(f"\n{'=' * 100}")
             print(f"  {nl} layers × {lsz:.0f} MB = {total_ram_needed:.1f} GB model")
-            print(f"{'='*100}")
+            print(f"{'=' * 100}")
             print(
                 f"  {'RAM':>5} {'Win':>4} {'Pref':>4} {'Res':>4} "
                 f"{'Tok/s':>7} {'GPU%':>5} {'Idle%':>5} {'Hit%':>5} "
                 f"{'Wait':>6} {'Peak':>7} {'Fits':>5}"
             )
             print(
-                f"  {'-'*5} {'-'*4} {'-'*4} {'-'*4} {'-'*7} {'-'*5} {'-'*5} {'-'*5} "
-                f"{'-'*6} {'-'*7} {'-'*5}"
+                f"  {'-' * 5} {'-' * 4} {'-' * 4} {'-' * 4} {'-' * 7} {'-' * 5} {'-' * 5} {'-' * 5} "
+                f"{'-' * 6} {'-' * 7} {'-' * 5}"
             )
 
             for p in sorted(pts, key=lambda x: (x.ram_gb, x.window_size, x.resident_count)):
@@ -132,8 +132,8 @@ class SweepResult:
                 print(
                     f"  {p.ram_gb:>4.0f}G {p.window_size:>4} {p.prefetch_depth:>4} "
                     f"{p.resident_count:>4} "
-                    f"{p.throughput_tokens_per_sec:>7.2f} {p.gpu_efficiency*100:>4.1f}% "
-                    f"{p.gpu_idle_pct:>4.1f}% {p.prefetch_hit_rate*100:>4.1f}% "
+                    f"{p.throughput_tokens_per_sec:>7.2f} {p.gpu_efficiency * 100:>4.1f}% "
+                    f"{p.gpu_idle_pct:>4.1f}% {p.prefetch_hit_rate * 100:>4.1f}% "
                     f"{p.avg_ensure_wait_ms:>5.1f} {p.peak_ram_mb:>6.0f}M {fits:>5}"
                 )
 
@@ -180,21 +180,23 @@ class SweepConfig:
             kw["resident_count"] = min(kw["resident_count"], kw["num_layers"])
             # Window can't exceed num_layers
             kw["window_size"] = min(kw["window_size"], kw["num_layers"])
-            configs.append(SimulatorConfig(
-                num_layers=kw["num_layers"],
-                layer_size_mb=kw["layer_size_mb"],
-                ram_capacity_gb=kw["ram_capacity_gb"],
-                window_size=kw["window_size"],
-                prefetch_depth=kw["prefetch_depth"],
-                resident_count=kw["resident_count"],
-                use_resident_cache=kw["resident_count"] > 0,
-                num_tokens=self.num_tokens,
-                compute_time_ms=self.compute_time_ms,
-                ssd_read_latency_ms=self.ssd_read_latency_ms,
-                upload_latency_ms=self.upload_latency_ms,
-                eviction_latency_ms=self.eviction_latency_ms,
-                worker_count=self.worker_count,
-            ))
+            configs.append(
+                SimulatorConfig(
+                    num_layers=kw["num_layers"],
+                    layer_size_mb=kw["layer_size_mb"],
+                    ram_capacity_gb=kw["ram_capacity_gb"],
+                    window_size=kw["window_size"],
+                    prefetch_depth=kw["prefetch_depth"],
+                    resident_count=kw["resident_count"],
+                    use_resident_cache=kw["resident_count"] > 0,
+                    num_tokens=self.num_tokens,
+                    compute_time_ms=self.compute_time_ms,
+                    ssd_read_latency_ms=self.ssd_read_latency_ms,
+                    upload_latency_ms=self.upload_latency_ms,
+                    eviction_latency_ms=self.eviction_latency_ms,
+                    worker_count=self.worker_count,
+                )
+            )
         return configs
 
 

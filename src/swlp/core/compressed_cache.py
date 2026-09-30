@@ -52,7 +52,7 @@ class CompressedDynamicLayer(DynamicLayer):
         if self.keys is None or self.keys.numel() == 0:
             return
         seq_len = int(self.keys.shape[-2])
-        # Phase 16: if kv_window is active the manager will trim the tensors;
+        # If kv_window is active the manager will trim the tensors;
         # record the trimmed length so get_seq_length() stays accurate.
         w = self._kv_manager.kv_window
         self._cold_seq_len = min(seq_len, w) if w > 0 else seq_len

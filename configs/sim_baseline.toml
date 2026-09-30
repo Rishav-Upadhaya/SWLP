@@ -9,7 +9,6 @@ generate_tokens = 64
 kv_bytes_per_token = 2048
 device_memory_mb = 8000
 ram_capacity_mb = 32000
-pcie_bandwidth_gbps = 12.0
 ram_bandwidth_gbps = 40.0
 disk_bandwidth_gbps = 1.5
 disk_staging = false

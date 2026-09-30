@@ -19,6 +19,7 @@ skewed -> entropy-codes well). Reconstruction interleaves the planes back.
 Usage:
     python scripts/research/codec_eval.py [shard_path]
 """
+
 from __future__ import annotations
 
 import argparse
@@ -172,7 +173,11 @@ def main() -> int:
             f"  {r['decode_gbps']:11.2f}  {'PASS' if ok else 'fail'}"
         )
         results.append(r)
-    passing = [r for r in results if r["ratio"] <= GATE_MAX_RATIO and r["decode_gbps"] >= GATE_MIN_DECODE_GBPS]
+    passing = [
+        r
+        for r in results
+        if r["ratio"] <= GATE_MAX_RATIO and r["decode_gbps"] >= GATE_MIN_DECODE_GBPS
+    ]
     if passing:
         best = min(passing, key=lambda r: r["ratio"])
         print(f"\ngate PASSED — best ratio among passing: {best['name']} ({best['ratio']:.3f})")

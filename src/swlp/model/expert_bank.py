@@ -79,17 +79,24 @@ class ExpertSlice:
     dtype_str: str       # safetensors dtype ("F16" | "BF16" | …)
     rows: int
     cols: int
+    # Absolute source file when it is not the layer's bank_file (MLX-format
+    # checkpoints spread one layer's expert tensors across shard files).
+    file: str = ""
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "slot": self.slot, "offset": self.offset, "nbytes": self.nbytes,
             "dtype": self.dtype_str, "rows": self.rows, "cols": self.cols,
         }
+        if self.file:
+            d["file"] = self.file
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> ExpertSlice:
         return cls(slot=d["slot"], offset=int(d["offset"]), nbytes=int(d["nbytes"]),
-                   dtype_str=d["dtype"], rows=int(d["rows"]), cols=int(d["cols"]))
+                   dtype_str=d["dtype"], rows=int(d["rows"]), cols=int(d["cols"]),
+                   file=d.get("file", ""))
 
 
 @dataclass(slots=True)

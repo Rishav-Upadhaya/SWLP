@@ -13,6 +13,7 @@ Usage:
     python scripts/research/kv_compare.py --config configs/swlp_mistral_mps.toml
     python scripts/research/kv_compare.py --config configs/swlp_mistral_mps.toml --sweep
 """
+
 from __future__ import annotations
 
 import argparse
@@ -67,9 +68,7 @@ def _run(config, prompt: str, compression: bool, level: int) -> dict:
 
 
 def _compare(config, prompt: str) -> dict:
-    kv_per_token = _kv_bytes_per_token(
-        config.model.model_id, str(config.cache.cache_dir)
-    )
+    kv_per_token = _kv_bytes_per_token(config.model.model_id, str(config.cache.cache_dir))
     off = _run(load_config_copy(config), prompt, compression=False, level=0)
     on = _run(load_config_copy(config), prompt, compression=True, level=6)
 
@@ -94,9 +93,7 @@ def _compare(config, prompt: str) -> dict:
 
 
 def _sweep(config, prompt: str) -> dict:
-    kv_per_token = _kv_bytes_per_token(
-        config.model.model_id, str(config.cache.cache_dir)
-    )
+    kv_per_token = _kv_bytes_per_token(config.model.model_id, str(config.cache.cache_dir))
     rows = []
     for level in (1, 3, 6, 9):
         run = _run(load_config_copy(config), prompt, compression=True, level=level)

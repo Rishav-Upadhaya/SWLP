@@ -100,23 +100,48 @@ def test_mock_stream_is_deterministic():
     assert "".join(tokens_a) == "".join(tokens_b)
 
 
-# ── CLI chat subcommand wiring ────────────────────────────────────────────────
+# ── chat behaviour ────────────────────────────────────────────────────────────
 
-def test_chat_subcommand_parses():
-    from swlp.cli_args import build_parser
+class _TemplateTok:
+    """Records the kwargs a chat template is rendered with."""
 
-    parser = build_parser()
-    args = parser.parse_args(
-        ["chat", "--backend", "mock", "--model", "tiny-gpt2", "--max-chat-tokens", "256"]
-    )
-    assert args.command == "chat"
-    assert args.backend == "mock"
-    assert args.max_chat_tokens == 256
+    chat_template = "{{ messages }}"
+
+    def __init__(self):
+        self.kwargs = {}
+
+    def apply_chat_template(self, history, **kwargs):
+        self.kwargs = kwargs
+        return "|".join(m["content"] for m in history)
 
 
-def test_chat_subcommand_default_max_tokens():
-    from swlp.cli_args import build_parser
+def test_reasoning_hidden_by_default_and_toggled():
+    session = ChatSession()
+    tok = _TemplateTok()
+    format_chat_prompt(session, tok, "hi")
+    assert tok.kwargs["enable_thinking"] is False
+    session.thinking = True
+    format_chat_prompt(session, tok, "hi")
+    assert tok.kwargs["enable_thinking"] is True
 
-    parser = build_parser()
-    args = parser.parse_args(["chat", "--backend", "mock"])
-    assert args.max_chat_tokens == 512
+
+def test_slash_commands():
+    from swlp.chat import _slash
+
+    session = ChatSession()
+    session.add_user("x")
+    assert _slash("/clear", session, runner=None) is True and session.messages == []
+    assert _slash("/think", session, runner=None) is True and session.thinking is True
+    assert _slash("/exit", session, runner=None) is False
+    assert _slash("/nope", session, runner=None) is True  # unknown → warn, stay
+
+
+def test_answer_streams_and_records_turn():
+    from swlp.chat import answer
+    from swlp.config import AppConfig
+    from swlp.runner.mock import MockRunner
+
+    session = ChatSession()
+    text = answer(MockRunner(AppConfig()), session, "hello", max_tokens=8)
+    assert text
+    assert [m["role"] for m in session.messages] == ["user", "assistant"]

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from swlp.reporting.policy_report import evaluate_policy_rows
+from scripts.research.simtools.policy_report import evaluate_policy_rows
 
 
 def test_policy_report_summary_metrics() -> None:

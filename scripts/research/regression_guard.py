@@ -11,6 +11,7 @@ Pass/fail conditions are enforced on:
 - Throughput (tokens/second)
 - Peak RSS RAM usage (MB)
 """
+
 from __future__ import annotations
 
 import argparse
@@ -58,24 +59,19 @@ def run_workload(backend: str, prompt: str) -> dict:
     cfg.runtime.log_level = "WARNING"
     cfg.generation.max_new_tokens = 32
 
-    # If running on macOS, default to mps if available, otherwise cpu
     import torch
-    if torch.backends.mps.is_available():
-        cfg.runtime.device = "mps"
-    elif torch.cuda.is_available():
-        cfg.runtime.device = "cuda"
-    else:
-        cfg.runtime.device = "cpu"
+
+    cfg.runtime.device = "mps" if torch.backends.mps.is_available() else "cpu"
 
     # Make sure we don't fall back to baseline silently for swlp
     if backend == "swlp":
         cfg.runtime.swlp_fallback_to_baseline = False
 
     LOGGER.info("Starting workload: backend=%s on %s", backend, cfg.runtime.device)
-    
+
     # Track RAM usage
     process = psutil.Process()
-    
+
     # Execute inference
     runner = build_runner(cfg)
     result = runner.run(prompt, profile=True)
@@ -89,7 +85,7 @@ def run_workload(backend: str, prompt: str) -> dict:
         "rss_mb": rss_mb,
         "completion_len": len(result.completion),
     }
-    
+
     LOGGER.info(
         "Completed workload %s: TTFT=%.3fs, Throughput=%.2f tok/s, RSS=%.1f MB",
         backend,
@@ -97,7 +93,7 @@ def run_workload(backend: str, prompt: str) -> dict:
         stats["throughput_tps"],
         stats["rss_mb"],
     )
-    
+
     return stats
 
 
@@ -161,30 +157,29 @@ def main() -> int:
     # Print summary table
     print("\n" + "=" * 80)
     header = (
-        f"{'Backend':<12} | {'Metric':<15} | "
-        f"{'Measured':<15} | {'Threshold':<15} | {'Status':<10}"
+        f"{'Backend':<12} | {'Metric':<15} | {'Measured':<15} | {'Threshold':<15} | {'Status':<10}"
     )
     print(header)
     print("-" * 80)
-    
+
     for stats in results:
         backend = stats["backend"]
         limits = THRESHOLDS[backend]
-        
+
         # TTFT
         ttft_ok = stats["ttft_s"] <= limits["max_ttft_s"]
         print(
             f"{backend:<12} | {'TTFT':<15} | {stats['ttft_s']:>13.3f}s | "
             f"< {limits['max_ttft_s']:>11.3f}s | {'PASS' if ttft_ok else 'FAIL'}"
         )
-        
+
         # Throughput
         tp_ok = stats["throughput_tps"] >= limits["min_throughput_tps"]
         print(
             f"{backend:<12} | {'Throughput':<15} | {stats['throughput_tps']:>11.2f} t/s | "
             f"> {limits['min_throughput_tps']:>9.2f} t/s | {'PASS' if tp_ok else 'FAIL'}"
         )
-        
+
         # RSS
         rss_ok = stats["rss_mb"] <= limits["max_rss_mb"]
         print(
@@ -201,7 +196,7 @@ def main() -> int:
             print(f"  - {failure}")
         print("=" * 80 + "\n")
         return 1
-    
+
     print("\n\n✅ ALL PERFORMANCE CHECKS PASSED SUCCESSFULLY!\n")
     return 0
 

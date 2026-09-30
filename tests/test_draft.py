@@ -8,7 +8,6 @@ self-healing) produces exactly the same tokens as a fresh no-cache greedy loop.
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 import pytest
 import torch
@@ -204,27 +203,3 @@ def _namespace(**overrides) -> argparse.Namespace:
     base = {"backend": None, "quant": None, "shard_dir": None, "draft_model": None}
     base.update(overrides)
     return argparse.Namespace(**base)
-
-
-def test_backend_autoselect_speculative_with_draft_and_shards() -> None:
-    from swlp.cli import _resolve_backend
-
-    config = load_config(None)
-    args = _namespace(shard_dir=Path("./shards/qwen-14b"), draft_model="qwen-0.5b")
-    assert _resolve_backend(args, config) == "speculative"
-
-
-def test_backend_autoselect_swlp_without_draft() -> None:
-    from swlp.cli import _resolve_backend
-
-    config = load_config(None)
-    args = _namespace(shard_dir=Path("./shards/qwen-14b"))
-    assert _resolve_backend(args, config) == "swlp"
-
-
-def test_explicit_backend_wins_over_draft_model() -> None:
-    from swlp.cli import _resolve_backend
-
-    config = load_config(None)
-    args = _namespace(backend="swlp", shard_dir=Path("x"), draft_model="qwen-0.5b")
-    assert _resolve_backend(args, config) == "swlp"

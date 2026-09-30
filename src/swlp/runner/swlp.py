@@ -12,14 +12,14 @@ import torch
 
 from ..config import AppConfig
 from ..core.compressed_cache import CompressedDynamicCache
+from ..core.decode_cache import ActivationCache, PreallocBuffer
 from ..core.kv_cache import KVCacheManager
-from ..core.phase23 import ActivationCache, EarlyExitDetector, LayerPruner, PreallocBuffer
 from ..core.pipeline_model import pipeline_ratio_from_metrics
 from ..core.profiler import LayerProfiler
 from ..core.scheduler import PrefetchError, SchedulerConfig, ThreadedScheduler
 from ..core.streaming import StreamingScheduler, has_shards
 from ..metrics import RunResult
-from .arch import ArchAdapter, GPT2Adapter, LlamaLikeAdapter, get_adapter
+from .arch import ArchAdapter, LlamaLikeAdapter, get_adapter
 from .hf import HuggingFaceRunner
 from .load import load_from_shards, load_full_model
 from .swlp_setup import SWLPSetupMixin
@@ -33,23 +33,30 @@ LOGGER = logging.getLogger(__name__)
 _DETOK_ANCHOR_TOKENS = 8
 
 
+def _process_memory_bytes(proc: psutil.Process) -> int:
+    """RSS plus MPS driver memory. On macOS, Metal allocations (streamed layer
+    weights, lm_head) are not in RSS — RSS alone under-reported a 10 GB
+    process as 2 GB while it was swapping."""
+    rss = int(proc.memory_info().rss)
+    if torch.backends.mps.is_available():
+        rss += int(torch.mps.driver_allocated_memory())
+    return rss
+
+
 class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
     backend = "swlp"
 
     def __init__(self, config: AppConfig) -> None:
         super().__init__(config)
-        # Phase 23: quality-neutral speedups (initialized on first run()).
+        # Byte-identical decode speedups (initialized on first run()).
         self._activation_cache: ActivationCache | None = None
         self._prealloc_buf: PreallocBuffer | None = None
-        # Phase 23: opt-in quality tradeoffs (initialized on first run()).
-        self._early_exit: EarlyExitDetector | None = None
-        self._layer_pruner: LayerPruner | None = None
         # Self-calibration: measured ratio from a previous run in this process.
         self._measured_pipeline_ratio: float | None = None
         self._last_residency_decision: dict | None = None
-        # Phase 26: optional prefix KV cache (set by the chat REPL).
+        # Optional prefix KV cache (set by the chat REPL).
         self._prefix_cache = None
-        # Phase 25: MoE expert scheduler (built in run() when the model is MoE).
+        # MoE expert scheduler (built in run() when the model is MoE).
         self._expert_sched = None
         # Per-run scratch state. Declared here, never conditionally created, so
         # a typo raises AttributeError instead of silently disabling a feature.
@@ -70,8 +77,6 @@ class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
             window_size=max(1, self.config.runtime.swlp_window_size),
             prefetch_depth=max(1, self.config.runtime.swlp_prefetch_depth),
             prefetch=self.config.runtime.swlp_prefetch,
-            double_buffer=self.config.runtime.swlp_double_buffer,
-            pin_memory=self.config.runtime.swlp_pin_memory,
         )
         shard_dir = self.config.runtime.shard_dir
         if shard_dir is not None and has_shards(shard_dir):
@@ -139,7 +144,7 @@ class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
             return 0.0
         started = time.perf_counter()
         shard_dir = self.config.runtime.shard_dir
-        # Phase 14: auto-shard on first run if shard_dir doesn't have shards yet.
+        # Auto-shard on first run if shard_dir doesn't have shards yet.
         if shard_dir is not None:
             self._auto_shard_if_needed(Path(shard_dir))
         if shard_dir is not None and has_shards(shard_dir):
@@ -235,11 +240,7 @@ class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
     ) -> torch.Tensor:
         assert self.model is not None
         blocks = adapter.get_blocks(self.model)
-        is_gpt2 = isinstance(adapter, GPT2Adapter)
         window = scheduler.config.window_size
-        # Phase 23: get opt-in features from config.
-        early_exit: EarlyExitDetector | None = self._early_exit
-        pruner: LayerPruner | None = self._layer_pruner
         # prefetch_depth extends the lookahead beyond the window when the disk
         # can serve more parallel reads than compute consumes; at most
         # ``lookahead`` device-ready layers are ever in flight, so RAM stays
@@ -269,18 +270,13 @@ class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
         for layer_index, block in enumerate(blocks):
             trace_entry: dict = {"layer": layer_index}
 
-            # Phase 25: MoE layers — prefetch experts predicted for this layer.
+            # MoE layers — prefetch experts predicted for this layer.
             expert_sched = self._expert_sched
             if expert_sched is not None:
                 try:
                     expert_sched.prepare_layer(layer_index)
                 except Exception as exc:
                     self.degrade(f"expert_prepare_failed(layer={layer_index}): {exc}", exc)
-
-            # Phase 23: Layer pruning — skip least-important layers.
-            if pruner is not None and pruner.should_skip(layer_index):
-                trace_entry["pruned"] = True
-                continue
 
             # ── prefetch: keep the next L layers in flight ───────────────────
             try:
@@ -314,21 +310,6 @@ class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
             trace_entry["compute_end"] = time.perf_counter()
             if prof:
                 prof.end_compute(layer_index)
-
-            # Phase 23: Early exit — check if remaining layers can be skipped.
-            # The entropy signal is defined over the NEXT-TOKEN distribution
-            # (phase23.EarlyExitDetector), so run the final norm before the
-            # lm_head projection — the same transform run() applies for the
-            # real distribution. Opt-in only: the default path skips the
-            # extra matmul entirely.
-            if early_exit is not None and not is_gpt2:
-                exit_hidden = adapter.final_norm(self.model, hidden_states[:, -1:, :])
-                exit_logits = self.model.lm_head(exit_hidden)
-                if early_exit.should_exit(layer_index, exit_logits):
-                    trace_entry["early_exit"] = True
-                    self._trace.append(trace_entry)
-                    scheduler.evict(layer_index)
-                    break
 
             # ── evict: free the layer immediately after compute ───────────────
             scheduler.evict(layer_index)
@@ -372,22 +353,13 @@ class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
         and ``ctx.past_state`` is the KV cache populated by the prefill sweep.
         """
         assert self.model is not None
-        cb: Callable[[str], None] | None = self._token_callback
-        # Phase 23: use pre-allocated buffer when enabled (avoids torch.cat per token).
+        # Use pre-allocated buffer when enabled (avoids torch.cat per token).
         prealloc: PreallocBuffer | None = self._prealloc_buf
         if prealloc is not None:
             # Copy prompt+first token into the pre-allocated buffer.
             seq_len = generated.shape[-1]
             prealloc._buf[:, :seq_len] = generated
             prealloc._length = seq_len
-        # Incremental detokenization: decode a short prompt anchor plus the
-        # generated ids and diff against the previous decode.  The anchor keeps
-        # SentencePiece space-prefixed tokens correct (▁word → " word") at the
-        # prompt boundary while making per-token decode cost independent of
-        # prompt length — the old path re-decoded prompt+completion and copied
-        # every generated id device→host on each step.
-        _stream_ids: list[int] | None = self._stream_ids
-        _prev_text: str = self._stream_prev_text
         _token_counter = 1  # prefill was token 0
         for _ in range(max(self.config.generation.max_new_tokens - 1, 0)):
             # Use prealloc buffer view if available, else raw tensor.
@@ -410,23 +382,35 @@ class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
             hidden_states = adapter.final_norm(self.model, ctx.hidden_states)
             logits = self.model.lm_head(hidden_states)[:, -1, :]
             next_token = self._select_next(logits, gen_view)
-            # Phase 23: append to pre-allocated buffer or fall back to torch.cat.
+            # Append to pre-allocated buffer or fall back to torch.cat.
             if prealloc is not None:
                 generated = prealloc.append(next_token)
             else:
                 generated = torch.cat([generated, next_token], dim=-1)
             next_id = int(next_token.item())
-            if cb is not None and self.tokenizer is not None and _stream_ids is not None:
-                _stream_ids.append(next_id)
-                _new_text = self.tokenizer.decode(_stream_ids, skip_special_tokens=True)
-                _delta = _new_text[len(_prev_text):]
-                if _delta:
-                    cb(_delta)
-                _prev_text = _new_text
+            self._emit_tokens([next_id])
             if self.tokenizer is not None and self.tokenizer.eos_token_id is not None:
                 if next_id == int(self.tokenizer.eos_token_id):
                     break
         return generated
+
+    def _emit_tokens(self, ids: list[int]) -> None:
+        """Stream newly generated ids to ``stream_tokens`` (no-op otherwise).
+
+        Incremental detokenization: decode a short prompt anchor plus the
+        generated ids and diff against the previous decode — the anchor keeps
+        SentencePiece space-prefixed tokens right at the prompt boundary. Shared
+        by the one-token loop and the speculative loop (several ids per sweep).
+        """
+        cb = self._token_callback
+        if cb is None or self.tokenizer is None or self._stream_ids is None:
+            return
+        self._stream_ids.extend(ids)
+        text = self.tokenizer.decode(self._stream_ids, skip_special_tokens=True)
+        delta = text[len(self._stream_prev_text):]
+        if delta:
+            cb(delta)
+        self._stream_prev_text = text
 
     def stream_tokens(self, prompt: str, max_tokens: int = 512) -> Iterator[str]:
         """Yield decoded tokens one at a time, streaming through the sliding window.
@@ -482,7 +466,7 @@ class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
         scheduler = None
         try:
             load_seconds = self.load()
-            peak_rss_bytes = max(peak_rss_bytes, memory_tracker.memory_info().rss)
+            peak_rss_bytes = max(peak_rss_bytes, _process_memory_bytes(memory_tracker))
 
             assert self.model is not None
             assert self.tokenizer is not None
@@ -500,7 +484,7 @@ class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
             blocks = adapter.get_blocks(self.model)
             scheduler = self._build_scheduler(blocks)
 
-            # ── Phase 23: initialize quality-neutral speedups ────────────────
+            # ── initialize quality-neutral speedups ────────────────
             rt = self.config.runtime
             # Activation cache: reused across calls in chat mode, so build it
             # once and keep it. The guard is `is None`, not `not hasattr` —
@@ -523,27 +507,6 @@ class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
                     )
             else:
                 self._prealloc_buf = None
-            # ── Phase 23: initialize opt-in quality tradeoffs ────────────────
-            # Early exit: skip remaining layers when confidence is high.
-            ee_str = str(rt.swlp_early_exit).strip().lower()
-            if ee_str not in ("off", "", "none"):
-                try:
-                    threshold = float(ee_str)
-                    self._early_exit = EarlyExitDetector(threshold=threshold)
-                    LOGGER.info("swlp_early_exit_enabled", extra={"threshold": threshold})
-                except (ValueError, TypeError):
-                    LOGGER.warning("swlp_early_exit_invalid", extra={"value": ee_str})
-                    self._early_exit = None
-            else:
-                self._early_exit = None
-            # Layer pruning: remove least-important layers.
-            lp_str = str(rt.swlp_layer_pruning).strip().lower()
-            if lp_str in ("light", "aggressive"):
-                self._layer_pruner = LayerPruner(mode=lp_str)
-                LOGGER.info("swlp_layer_pruning_enabled", extra={"mode": lp_str})
-            else:
-                self._layer_pruner = None
-
             # Pre-load resident layers once before inference starts.
             if hasattr(scheduler, "load_resident_layers"):
                 scheduler.load_resident_layers()
@@ -574,12 +537,12 @@ class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
             encoded = self.tokenizer(prompt, return_tensors="pt")
             input_ids = encoded["input_ids"].to(self.device)
             preprocess_seconds = time.perf_counter() - preprocess_start
-            peak_rss_bytes = max(peak_rss_bytes, memory_tracker.memory_info().rss)
+            peak_rss_bytes = max(peak_rss_bytes, _process_memory_bytes(memory_tracker))
             prompt_tokens = int(input_ids.shape[-1])
 
             past_state = self._make_past_state(adapter, len(blocks))
 
-            # Phase 26: prefix KV reuse — seed the cache with the longest
+            # Prefix KV reuse — seed the cache with the longest
             # cached prefix and feed only the suffix. Lossless: identical
             # prefixes produce bitwise-identical KV under greedy decode.
             prefix_hit = None
@@ -621,7 +584,7 @@ class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
                 chunk = max(0, int(self.config.runtime.swlp_prefill_chunk))
                 seq_len = int(input_ids.shape[-1])
                 if chunk > 0 and seq_len > chunk:
-                    # Chunked prefill (Phase 26): sweep the prompt in slices,
+                    # Chunked prefill: sweep the prompt in slices,
                     # KV accumulating across chunks. Lossless — causal
                     # attention over the prefix cache; bounds activation RAM.
                     offset = base_offset
@@ -642,7 +605,7 @@ class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
                         adapter, ctx, scheduler, token_index=0
                     )
                 hidden_states = adapter.final_norm(self.model, ctx.hidden_states)
-                # Phase 15: first_token_start marks the end of the prefill sweep
+                # First_token_start marks the end of the prefill sweep
                 # (all input tokens have been processed).  Everything before this
                 # point is prefill; everything after is argmax + decode.
                 first_token_start = time.perf_counter()
@@ -685,20 +648,17 @@ class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
                         self._stream_ids = None
                         self._stream_prev_text = ""
                     generated = self._generate_remaining(adapter, scheduler, ctx, generated)
+            peak_rss_bytes = max(peak_rss_bytes, _process_memory_bytes(memory_tracker))
 
-            # Phase 26: persist this run's KV as a reusable prefix snapshot.
-            # Same gating as the lookup path (Llama-like + exact DynamicCache),
-            # and disabled when a lossy feature could desync layer lengths —
-            # early exit truncates trailing layers' KV, which would poison
-            # snapshots. Snapshot ids = full sequence (any seeded prefix +
+            # Persist this run's KV as a reusable prefix snapshot.
+            # Same gating as the lookup path (Llama-like + exact DynamicCache).
+            # Snapshot ids = full sequence (any seeded prefix +
             # this run's prompt ids + generated ids), aligned to the fed-KV
             # length by store().
             if (
                 prefix_cache is not None
                 and past_state is not None
                 and isinstance(adapter, LlamaLikeAdapter)
-                and self._early_exit is None
-                and self._layer_pruner is None
             ):
                 from transformers.cache_utils import DynamicCache as _DC
 
@@ -737,7 +697,7 @@ class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
 
             generate_seconds = time.perf_counter() - generation_start
             total_seconds = load_seconds + preprocess_seconds + generate_seconds
-            peak_rss_bytes = max(peak_rss_bytes, memory_tracker.memory_info().rss)
+            peak_rss_bytes = max(peak_rss_bytes, _process_memory_bytes(memory_tracker))
             output_tokens = int(generated.shape[-1])
             generated_tokens = max(output_tokens - prompt_tokens, 0)
 
@@ -801,22 +761,22 @@ class SWLPRunner(SWLPSetupMixin, HuggingFaceRunner):
                             "avg_compute_ms": round(metrics.avg_compute_ms, 2),
                         },
                     )
-                    # `swlp profile --timeline/--detail/--summary` gate these
-                    # prints; default (no flags) prints timeline + summary.
-                    prints = self._profile_prints or {
-                        "timeline": True, "detail": False, "summary": True,
-                    }
-                    if prints.get("timeline"):
-                        prof.print_timeline()
-                    if prints.get("detail"):
-                        prof.print_layer_detail()
-                    if prints.get("summary"):
-                        prof.print_pipeline_summary()
-                    # swlp profile --output routes the dump here; the runner
-                    # also records the path so the CLI can report the file.
-                    dump_path = str(self._trace_output or "layer_traces.json")
-                    prof.dump(dump_path)
-                    self._last_trace_path = dump_path
+                    # Printing and the trace dump are opt-in (profile=True or
+                    # SWLP_PROFILE=1): they used to print into every chat
+                    # answer and write layer_traces.json into the cwd.
+                    if profile or self.config.runtime.profile:
+                        prints = self._profile_prints or {
+                            "timeline": True, "detail": False, "summary": True,
+                        }
+                        if prints.get("timeline"):
+                            prof.print_timeline()
+                        if prints.get("detail"):
+                            prof.print_layer_detail()
+                        if prints.get("summary"):
+                            prof.print_pipeline_summary()
+                        dump_path = str(self._trace_output or "layer_traces.json")
+                        prof.dump(dump_path)
+                        self._last_trace_path = dump_path
             except Exception as exc:
                 self.degrade(f"profiler_dump_failed: {exc}", exc)
             try:

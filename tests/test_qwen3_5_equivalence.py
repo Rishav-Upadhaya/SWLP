@@ -64,3 +64,26 @@ def test_qwen3_5_shards_and_streams_like_hf(tmp_path: Path) -> None:
     got, _ = _run_capturing(runner, TURN1_IDS)
     assert load_manifest(shard_dir).model_type == "qwen3_5"
     _assert_generation_equivalent(got, ref, "qwen3_5 streamed vs HF reference")
+
+
+def test_bf16_checkpoint_shards_bf16_with_mtp(tmp_path: Path) -> None:
+    """dtype 'auto' keeps a bf16 checkpoint bf16 (bf16->fp16 is lossy) and
+    records it in the manifest; mtp.* tensors land in mtp.safetensors."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    from swlp.model.shard import MTP_FILE
+
+    model = _tiny_qwen3_5().to(torch.bfloat16)
+    hf_dir = tmp_path / "hf"
+    model.save_pretrained(hf_dir)
+    save_file({"mtp.fc.weight": torch.ones(32, 64, dtype=torch.bfloat16)},
+              str(hf_dir / "mtp_extra.safetensors"))
+    shard_dir = tmp_path / "shards"
+    manifest = shard_model_by_layer(str(hf_dir), shard_dir)
+    assert manifest.weight_dtype == "bfloat16"
+    assert load_manifest(shard_dir).weight_dtype == "bfloat16"
+    with safe_open(str(shard_dir / "layer_000.safetensors"), "pt") as f:
+        assert all(f.get_slice(k).get_dtype() == "BF16" for k in f.keys())
+    with safe_open(str(shard_dir / MTP_FILE), "pt") as f:
+        assert list(f.keys()) == ["fc.weight"]

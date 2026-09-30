@@ -31,11 +31,9 @@ Usage:
 import argparse
 import gc
 import json
-import math
 import sys
 import time
 from pathlib import Path
-from typing import Any
 
 import torch
 
@@ -44,8 +42,14 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import bench_common  # noqa: E402
 
-from swlp.config import AppConfig, CacheConfig, GenerationConfig, ModelConfig, RuntimeConfig
-from swlp.runner import build_runner
+from swlp.config import (  # noqa: E402
+    AppConfig,
+    CacheConfig,
+    GenerationConfig,
+    ModelConfig,
+    RuntimeConfig,
+)
+from swlp.runner import build_runner  # noqa: E402
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
@@ -65,6 +69,7 @@ DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _make_config(model_id: str, backend: str, shard_dir: str | None = None) -> AppConfig:
     return AppConfig(
@@ -126,13 +131,15 @@ def _collect_hf_logits(model_id: str, prompt: str) -> tuple[list[int], list[dict
             top5 = torch.topk(logits_step, 5)
             chosen = int(logits_step.argmax().item())
             logit_chosen = float(logits_step[chosen].item())
-            step_data.append({
-                "chosen_token":  chosen,
-                "top5_tokens":   top5.indices.tolist(),
-                "top5_logits":   top5.values.tolist(),
-                "logit_chosen":  logit_chosen,
-                "logit_max":     float(top5.values[0].item()),
-            })
+            step_data.append(
+                {
+                    "chosen_token": chosen,
+                    "top5_tokens": top5.indices.tolist(),
+                    "top5_logits": top5.values.tolist(),
+                    "logit_chosen": logit_chosen,
+                    "logit_max": float(top5.values[0].item()),
+                }
+            )
             tokens.append(chosen)
             generated = torch.cat(
                 [generated, torch.tensor([[chosen]], device=runner.device)], dim=1
@@ -164,7 +171,7 @@ def _ensure_shards(model_id: str, shard_dir: Path) -> None:
         return
     print(f"  [shards] creating shards for {model_id} → {shard_dir}")
     shard_model_by_layer(model_id, shard_dir)
-    print(f"  [shards] done")
+    print("  [shards] done")
 
 
 def _perplexity_from_logits(step_data: list[dict]) -> float:
@@ -177,7 +184,7 @@ def _perplexity_from_logits(step_data: list[dict]) -> float:
     top_logits = [s["logit_max"] for s in step_data]
     chosen_logits = [s["logit_chosen"] for s in step_data]
     # "confidence ratio": how close chosen is to the max
-    confidence = sum(c == m for c, m in zip(chosen_logits, top_logits)) / len(top_logits)
+    confidence = sum(c == m for c, m in zip(chosen_logits, top_logits, strict=False)) / len(top_logits)
     return confidence  # fraction of steps where chosen == argmax (should be 1.0)
 
 
@@ -185,21 +192,24 @@ def _perplexity_from_logits(step_data: list[dict]) -> float:
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="SWLP vs HF quality equivalence")
-    parser.add_argument("--model", default="hf-internal-testing/tiny-random-gpt2",
-                        help="HuggingFace model id")
-    parser.add_argument("--shard-dir", default=None,
-                        help="path to pre-sharded layers (created if absent)")
+    parser.add_argument(
+        "--model", default="hf-internal-testing/tiny-random-gpt2", help="HuggingFace model id"
+    )
+    parser.add_argument(
+        "--shard-dir", default=None, help="path to pre-sharded layers (created if absent)"
+    )
     args = parser.parse_args()
 
     model_id = args.model
     shard_dir_arg = args.shard_dir
 
-    print(f"\n{'═'*70}")
+    print(f"\n{'═' * 70}")
     print(f"  SWLP Quality Equivalence — {model_id}")
     print(f"  device={DEVICE}  max_new_tokens={MAX_NEW_TOKENS}  seed={SEED}")
-    print(f"{'═'*70}\n")
+    print(f"{'═' * 70}\n")
 
     if shard_dir_arg:
         shard_dir = Path(shard_dir_arg).resolve()
@@ -223,6 +233,7 @@ def main() -> None:
             print(f" ERROR: {exc}")
             raise
         from swlp.runner.hf import HuggingFaceRunner
+
         hf_cfg = _make_config(model_id, "hf")
         tmp_runner = HuggingFaceRunner(hf_cfg)
         tmp_runner.load()
@@ -244,7 +255,7 @@ def main() -> None:
         except Exception as exc:
             print(f" ERROR: {exc}")
             raise
-        print(f" done")
+        print(" done")
 
         # ── Compare ──────────────────────────────────────────────────────
         exact = hf_completion.strip() == swlp_completion.strip()
@@ -256,24 +267,24 @@ def main() -> None:
         print()
 
         prompt_results[pid] = {
-            "prompt":           prompt,
-            "hf_tokens":        hf_tokens,
-            "hf_completion":    hf_completion,
-            "swlp_completion":  swlp_completion,
+            "prompt": prompt,
+            "hf_tokens": hf_tokens,
+            "hf_completion": hf_completion,
+            "swlp_completion": swlp_completion,
             "completions_identical": exact,
             "hf_argmax_confidence": round(confidence, 6),
-            "hf_step_data":     hf_step_data,
+            "hf_step_data": hf_step_data,
         }
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    print(f"{'─'*70}")
+    print(f"{'─' * 70}")
     verdict = (
         "✅ ALL COMPLETIONS IDENTICAL — SWLP is output-equivalent to HF"
         if all_agree
         else "⚠ SOME DIVERGENCE — completions differ between HF and SWLP"
     )
     print(f"  Verdict: {verdict}")
-    print(f"{'─'*70}\n")
+    print(f"{'─' * 70}\n")
 
     # ── Save JSON ──────────────────────────────────────────────────────────────
     out_dir = PROJECT_ROOT / "benchmarks"
@@ -281,17 +292,21 @@ def main() -> None:
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     out_path = out_dir / f"quality_equivalence_{ts}.json"
     with open(out_path, "w") as f:
-        json.dump({
-            "timestamp":       ts,
-            "model_id":        model_id,
-            "shard_dir":       str(shard_dir),
-            "device":          DEVICE,
-            "max_new_tokens":  MAX_NEW_TOKENS,
-            "seed":            SEED,
-            "all_identical":   all_agree,
-            "provenance":      bench_common.provenance(),
-            "prompts":         prompt_results,
-        }, f, indent=2)
+        json.dump(
+            {
+                "timestamp": ts,
+                "model_id": model_id,
+                "shard_dir": str(shard_dir),
+                "device": DEVICE,
+                "max_new_tokens": MAX_NEW_TOKENS,
+                "seed": SEED,
+                "all_identical": all_agree,
+                "provenance": bench_common.provenance(),
+                "prompts": prompt_results,
+            },
+            f,
+            indent=2,
+        )
     print(f"✓ Results saved → {out_path}")
 
 

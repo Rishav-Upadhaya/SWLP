@@ -27,7 +27,7 @@ jobs:
         run: pip install -e ".[dev,codec,apple]"
 
       - name: Lint
-        run: ruff check src/
+        run: ruff check src tests scripts
 
       - name: Test
         run: pytest --tb=short --cov=swlp --cov-report=term-missing --cov-fail-under=65

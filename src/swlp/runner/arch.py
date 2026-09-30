@@ -181,7 +181,9 @@ class LlamaLikeAdapter:
 
     def device_modules(self, model: nn.Module) -> list[nn.Module]:
         inner = model.model
-        mods = [inner.embed_tokens, inner.norm, model.lm_head]
+        # embed_tokens is deliberately absent: it stays wherever the loader
+        # put it (CPU mmap for shard streaming) — see prepare_step.
+        mods = [inner.norm, model.lm_head]
         if hasattr(inner, "rotary_emb"):
             mods.append(inner.rotary_emb)
         return mods
@@ -210,7 +212,8 @@ class LlamaLikeAdapter:
         attention_mask: torch.Tensor | None = None,
     ) -> StepContext:
         inner = model.model
-        inputs_embeds = inner.embed_tokens(input_ids)
+        embed = inner.embed_tokens
+        inputs_embeds = embed(input_ids.to(embed.weight.device)).to(device)
         seq_len = input_ids.shape[-1]
 
         if attention_mask is not None:
@@ -228,14 +231,7 @@ class LlamaLikeAdapter:
                 dtype=torch.long,
             ).unsqueeze(0)
 
-        position_embeddings = None
-        if hasattr(inner, "rotary_emb"):
-            rope_ids = position_ids
-            if hasattr(inner.rotary_emb, "mrope_section"):
-                # mRoPE (qwen3_5) rotates over 3 axes; for text-only input every
-                # axis is the token position, which is what HF's forward builds.
-                rope_ids = position_ids[None].expand(3, *position_ids.shape)
-            position_embeddings = inner.rotary_emb(inputs_embeds, position_ids=rope_ids)
+        position_embeddings = rope_embeddings(inner, inputs_embeds, position_ids)
 
         causal_mask = _build_causal_mask(
             model.config, inputs_embeds, past_state, position_ids, attention_mask
@@ -254,7 +250,9 @@ class LlamaLikeAdapter:
         self, block: nn.Module, ctx: StepContext, layer_idx: int
     ) -> tuple[torch.Tensor, Any]:
         mask = ctx.causal_mask
-        if getattr(block, "layer_type", None) == "linear_attention":
+        # transformers 5.8 names it ``block_type`` (``layer_type`` before).
+        kind = getattr(block, "block_type", None) or getattr(block, "layer_type", None)
+        if kind == "linear_attention":
             mask = _linear_attn_mask(ctx)
         outputs = block(
             ctx.hidden_states,
@@ -286,6 +284,20 @@ class LlamaLikeAdapter:
         )
         bytes_per = torch.tensor([], dtype=dtype).element_size()
         return 2 * n_layer * n_kv_heads * head_dim * bytes_per
+
+
+def rope_embeddings(
+    inner: nn.Module, inputs_embeds: torch.Tensor, position_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """(cos, sin) from the decoder's rotary module, or None if it has none."""
+    if not hasattr(inner, "rotary_emb"):
+        return None
+    rope_ids = position_ids
+    if hasattr(inner.rotary_emb, "mrope_section"):
+        # mRoPE (qwen3_5) rotates over 3 axes; for text-only input every
+        # axis is the token position, which is what HF's forward builds.
+        rope_ids = position_ids[None].expand(3, *position_ids.shape)
+    return inner.rotary_emb(inputs_embeds, position_ids=rope_ids)
 
 
 def _linear_attn_mask(ctx: StepContext) -> torch.Tensor | None:
@@ -352,6 +364,7 @@ _LLAMA_LIKE_TYPES = {
     "qwen2",
     "qwen3",
     "qwen3_5",
+    "qwen3_5_text",
     "phi",
     "phi3",
     "gemma",

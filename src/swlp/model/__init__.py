@@ -1,5 +1,4 @@
 """Model operations: layer sharding and the original package format."""
-from .quant import dequantize_layer_state, quantize_layer_state, requantize_shards
 from .shard import (
     ShardIntegrityReport,
     ShardManifest,
@@ -18,7 +17,4 @@ __all__ = [
     "load_manifest",
     "get_layer_path",
     "list_layer_paths",
-    "quantize_layer_state",
-    "dequantize_layer_state",
-    "requantize_shards",
 ]

@@ -1,7 +1,7 @@
 """Tests for the discrete-event scheduler simulator."""
 import json
 
-from swlp.benchmark.event_simulator import (
+from scripts.research.simtools.event_simulator import (
     AdaptiveResidentStrategy,
     DynamicSchedulerStrategy,
     EventSimulator,

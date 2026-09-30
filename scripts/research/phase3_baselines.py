@@ -18,6 +18,7 @@ Usage:
     python scripts/research/phase3_baselines.py --baseline all
     python scripts/research/phase3_baselines.py --baseline mlx --out benchmarks/phase3.json
 """
+
 from __future__ import annotations
 
 import argparse
@@ -39,7 +40,7 @@ from swlp.logging import configure_logging  # noqa: E402
 from swlp.runner.base import execute_baseline  # noqa: E402
 
 # Rough FP16 model size: 2 bytes × num_params. Mistral-7B ≈ 7e9 × 2 = 14 GB.
-_MISTRAL_FP16_BYTES = int(14.0 * 1024 ** 3)
+_MISTRAL_FP16_BYTES = int(14.0 * 1024**3)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -89,20 +90,33 @@ def bench_ollama() -> dict:
             tags = json.loads(resp.read())
         have = any(OLLAMA_MODEL in m.get("name", "") for m in tags.get("models", []))
         if not have:
-            LOGGER.warning("ollama model %s not pulled — run `ollama pull %s`",
-                            OLLAMA_MODEL, OLLAMA_MODEL)
-            return _record("Ollama", "ollama", "Q4_K_M", "quantized",
-                           None, None, None, None, None,
-                           error=f"model {OLLAMA_MODEL} not pulled")
+            LOGGER.warning(
+                "ollama model %s not pulled — run `ollama pull %s`", OLLAMA_MODEL, OLLAMA_MODEL
+            )
+            return _record(
+                "Ollama",
+                "ollama",
+                "Q4_K_M",
+                "quantized",
+                None,
+                None,
+                None,
+                None,
+                None,
+                error=f"model {OLLAMA_MODEL} not pulled",
+            )
 
-        payload = json.dumps({
-            "model": OLLAMA_MODEL,
-            "prompt": PROMPT,
-            "stream": True,
-            "options": {"num_predict": MAX_NEW_TOKENS, "temperature": 0.0, "seed": 42},
-        }).encode("utf-8")
+        payload = json.dumps(
+            {
+                "model": OLLAMA_MODEL,
+                "prompt": PROMPT,
+                "stream": True,
+                "options": {"num_predict": MAX_NEW_TOKENS, "temperature": 0.0, "seed": 42},
+            }
+        ).encode("utf-8")
         req = urllib.request.Request(
-            f"{OLLAMA_URL}/api/generate", data=payload,
+            f"{OLLAMA_URL}/api/generate",
+            data=payload,
             headers={"Content-Type": "application/json"},
         )
         chunks: list[str] = []
@@ -124,12 +138,21 @@ def bench_ollama() -> dict:
                     eval_count = int(obj.get("eval_count", 0))
                     eval_duration_ns = int(obj.get("eval_duration", 0))
         tok_s = (eval_count / (eval_duration_ns / 1e9)) if eval_duration_ns else None
-        return _record("Ollama", "ollama", "Q4_K_M", "quantized",
-                        tok_s, ttft, time.perf_counter() - start, None,
-                        "".join(chunks).strip())
+        return _record(
+            "Ollama",
+            "ollama",
+            "Q4_K_M",
+            "quantized",
+            tok_s,
+            ttft,
+            time.perf_counter() - start,
+            None,
+            "".join(chunks).strip(),
+        )
     except (urllib.error.URLError, OSError) as exc:
-        return _record("Ollama", "ollama", "Q4_K_M", "quantized",
-                        None, None, None, None, None, error=str(exc))
+        return _record(
+            "Ollama", "ollama", "Q4_K_M", "quantized", None, None, None, None, None, error=str(exc)
+        )
 
 
 def bench_mlx() -> dict:
@@ -166,11 +189,21 @@ def bench_mlx() -> dict:
         generate_s = time.perf_counter() - start
         tok_s = last.generation_tps if last else None
         peak = last.peak_memory if last else None
-        return _record("MLX-lm", "mlx", "4bit", "quantized",
-                        tok_s, ttft, generate_s, peak, "".join(text).strip())
+        return _record(
+            "MLX-lm",
+            "mlx",
+            "4bit",
+            "quantized",
+            tok_s,
+            ttft,
+            generate_s,
+            peak,
+            "".join(text).strip(),
+        )
     except Exception as exc:  # noqa: BLE001 — isolate baseline failure
-        return _record("MLX-lm", "mlx", "4bit", "quantized",
-                        None, None, None, None, None, error=repr(exc))
+        return _record(
+            "MLX-lm", "mlx", "4bit", "quantized", None, None, None, None, None, error=repr(exc)
+        )
 
 
 def bench_airllm(cold: bool = False) -> dict:
@@ -201,13 +234,15 @@ def bench_airllm(cold: bool = False) -> dict:
         generate_s = time.perf_counter() - start
         completion = tokenizer.decode([t.item() for t in tokens])
         tok_s = len(tokens) / generate_s if generate_s else None
-        record = _record("AirLLM", "airllm", "fp16", "fp16",
-                         tok_s, ttft, generate_s, None, completion.strip())
+        record = _record(
+            "AirLLM", "airllm", "fp16", "fp16", tok_s, ttft, generate_s, None, completion.strip()
+        )
         record["cache_state"] = cache_state
         return record
     except Exception as exc:  # noqa: BLE001 — isolate baseline failure
-        return _record("AirLLM", "airllm", "fp16", "fp16",
-                        None, None, None, None, None, error=repr(exc))
+        return _record(
+            "AirLLM", "airllm", "fp16", "fp16", None, None, None, None, None, error=repr(exc)
+        )
 
 
 def _stats(values: list[float]) -> dict | None:
@@ -215,6 +250,7 @@ def _stats(values: list[float]) -> dict | None:
     if not values:
         return None
     import statistics as _st
+
     ordered = sorted(values)
     return {
         "mean": sum(ordered) / len(ordered),
@@ -274,11 +310,22 @@ def bench_swlp(runs: int = 1, cold: bool = False) -> dict:
             completion = result.completion.strip()
 
         record = _record(
-            "SWLP", "swlp", "fp16", "fp16",
-            tps_list[0] if len(tps_list) == 1 else (sum(tps_list) / len(tps_list) if tps_list else None),
-            ttft_list[0] if len(ttft_list) == 1 else (sum(ttft_list) / len(ttft_list) if ttft_list else None),
-            gen_list[0] if len(gen_list) == 1 else (sum(gen_list) / len(gen_list) if gen_list else None),
-            peak_list[0] if len(peak_list) == 1 else (sum(peak_list) / len(peak_list) if peak_list else None),
+            "SWLP",
+            "swlp",
+            "fp16",
+            "fp16",
+            tps_list[0]
+            if len(tps_list) == 1
+            else (sum(tps_list) / len(tps_list) if tps_list else None),
+            ttft_list[0]
+            if len(ttft_list) == 1
+            else (sum(ttft_list) / len(ttft_list) if ttft_list else None),
+            gen_list[0]
+            if len(gen_list) == 1
+            else (sum(gen_list) / len(gen_list) if gen_list else None),
+            peak_list[0]
+            if len(peak_list) == 1
+            else (sum(peak_list) / len(peak_list) if peak_list else None),
             completion,
         )
         record["cache_state"] = bench_common.summarize_cache(cache_states) if cold else "warm"
@@ -292,8 +339,9 @@ def bench_swlp(runs: int = 1, cold: bool = False) -> dict:
             }
         return record
     except Exception as exc:  # noqa: BLE001 — isolate baseline failure
-        return _record("SWLP", "swlp", "fp16", "fp16",
-                        None, None, None, None, None, error=repr(exc))
+        return _record(
+            "SWLP", "swlp", "fp16", "fp16", None, None, None, None, None, error=repr(exc)
+        )
 
 
 _NON_SWLP_BASELINES = {
@@ -321,16 +369,12 @@ def main() -> int:
         "--cold",
         action="store_true",
         help="Drop the OS page cache before each timed streaming run (true "
-             "cold-SSD throughput; needs sudo for `purge` on macOS / root on Linux).",
+        "cold-SSD throughput; needs sudo for `purge` on macOS / root on Linux).",
     )
     args = parser.parse_args()
 
     configure_logging("INFO", json_logs=False)
-    selected = (
-        [*_NON_SWLP_BASELINES, "swlp"]
-        if args.baseline == "all"
-        else [args.baseline]
-    )
+    selected = [*_NON_SWLP_BASELINES, "swlp"] if args.baseline == "all" else [args.baseline]
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     report: dict = {}

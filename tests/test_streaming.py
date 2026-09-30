@@ -1,5 +1,5 @@
-"""Tests for swlp.core.streaming — StreamingScheduler overlap tracking, pin_memory,
-and the F_NOCACHE direct-I/O helpers."""
+"""Tests for swlp.core.streaming — StreamingScheduler overlap tracking and the
+F_NOCACHE direct-I/O helpers."""
 from __future__ import annotations
 
 import time
@@ -19,7 +19,6 @@ from swlp.core.streaming import (
 
 
 def _make_config(
-    pin_memory: bool = False,
     prefetch: bool = True,
     window_size: int = 2,
 ) -> SchedulerConfig:
@@ -27,8 +26,6 @@ def _make_config(
         window_size=window_size,
         prefetch_depth=1,
         prefetch=prefetch,
-        double_buffer=True,
-        pin_memory=pin_memory,
     )
 
 
@@ -103,17 +100,6 @@ def test_evict_removes_from_loaded(tmp_path: Path) -> None:
     assert 0 in scheduler._loaded
     scheduler.evict(0)
     assert 0 not in scheduler._loaded
-
-
-def test_pin_memory_no_crash(tmp_path: Path) -> None:
-    """pin_memory=True must not crash even when CUDA is unavailable."""
-    shard_dir = tmp_path / "shards"
-    blocks = _write_shards(shard_dir)
-    cfg = _make_config(pin_memory=True, prefetch=False)
-    scheduler = StreamingScheduler(blocks, torch.device("cpu"), cfg, shard_dir)
-    # Should complete without error regardless of CUDA availability.
-    scheduler.ensure(0)
-    assert 0 in scheduler._loaded
 
 
 def test_multiple_ensures_accumulate_stats(tmp_path: Path) -> None:

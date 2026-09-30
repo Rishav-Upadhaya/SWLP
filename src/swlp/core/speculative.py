@@ -14,7 +14,7 @@ pattern in the sequence generated so far, and copying whatever followed it.
 This is *draft-model-free* speculative decoding:
 
 - zero extra RAM (no second model resident — critical on the memory-bound M5,
-  see ``docs/phase5_design_decisions.md``),
+  see the Phase 5 appendix of ``docs/ROADMAP.md``),
 - no tokenizer mismatch (it operates on the target model's own token IDs),
 - lossless — every proposed token is still greedily verified by the target
   model, so output is bit-identical to plain greedy decoding.

@@ -579,7 +579,8 @@ class LayerProfiler:
 
     def print_timeline(self, max_layers: int = 32) -> None:
         """Print a simple text timeline for visual inspection."""
-        traces = self.get_traces()[:max_layers]
+        all_traces = self.get_traces()
+        traces = all_traces[:max_layers]
         if not traces:
             print("No traces recorded.")
             return
@@ -607,7 +608,10 @@ class LayerProfiler:
 
         total_span = (t_max - t_min) * 1000
         print(f"\n{'='*80}")
-        print(f"PIPELINE TIMELINE — {len(traces)} layers, {total_span:.1f} ms total")
+        print(
+            f"PIPELINE TIMELINE — first {len(traces)} of {len(all_traces)} layer traces, "
+            f"{total_span:.1f} ms span"
+        )
         print(f"{'='*80}")
         print(
             f"{'Layer':>6} | {'Read':>8} | {'Deser':>8} | {'Upload':>8} | {'Ready->Comp':>10} | "

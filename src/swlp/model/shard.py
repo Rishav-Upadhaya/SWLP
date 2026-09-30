@@ -34,6 +34,8 @@ from .. import codec
 LOGGER = logging.getLogger(__name__)
 
 MANIFEST_FILE = "shard_manifest.json"
+# Native multi-token-prediction head, written when the checkpoint has mtp.* tensors.
+MTP_FILE = "mtp.safetensors"
 
 
 @dataclass
@@ -45,21 +47,24 @@ class ShardManifest:
     embed_file: str
     lm_head_file: str
     model_type: str
-    # On-disk weight precision of the layer shards: "float16" (default, legacy)
-    # or "float8" (Phase 7 FP8 tier). Defaulted so old manifests still load.
+    # On-disk weight precision of the layer shards ("float16" | "bfloat16").
     weight_dtype: str = "float16"
-    # Phase 17: file format for layer shards: "safetensors" (new) or "pt" (legacy).
+    # File format for layer shards: "safetensors" (new) or "pt" (legacy).
     # Defaulted to "pt" so old manifests (missing this field) still load correctly.
     shard_format: str = "pt"
     # Lossless layer-shard compression: "none" or "swz" (zipnn container,
     # produced by compress_shards). Defaulted so old manifests still load.
     shard_compression: str = "none"
-    # Phase 25 (MoE): expert weights live in per-layer ``.experts.safetensors``
+    # MoE: expert weights live in per-layer ``.experts.safetensors``
     # banks when ``expert_bank`` is true; ``num_experts``/``top_k`` describe the
     # routing. Zero/False for dense models — old manifests load unchanged.
     num_experts: int = 0
     top_k: int = 0
     expert_bank: bool = False
+    # Precision of the checkpoint the shards came from when it was itself
+    # quantized ("fp8" for block-FP8 releases): shards are exact w.r.t. that
+    # release, not the original full-precision model.
+    source_quant: str = ""
     # Round-1 audit: per-layer expert-bank bytes (MB). layer_weight_mb is
     # dense-only; the expert cache budgets against this field instead.
     expert_weight_mb: float = 0.0
@@ -89,7 +94,7 @@ class ShardIntegrityReport:
 def shard_model_by_layer(
     model_id: str,
     output_dir: str | Path,
-    dtype_str: str = "float16",
+    dtype_str: str = "auto",
     cache_dir: str | None = None,
     progress: Callable[[int, int, float], None] | None = None,
 ) -> ShardManifest:
@@ -108,16 +113,20 @@ def shard_model_by_layer(
     from transformers import AutoConfig
 
     output_path = Path(output_dir)
-    dtype = getattr(torch, dtype_str, torch.float16)
     LOGGER.info("shard_start", extra={"model_id": model_id, "output_dir": str(output_path)})
 
     local_path = _resolve_model_files(model_id, cache_dir)
     weight_map = _build_weight_map(local_path)
 
-    cfg = AutoConfig.from_pretrained(str(local_path))
-    model_type = getattr(cfg, "model_type", "unknown")
+    full_cfg = AutoConfig.from_pretrained(str(local_path))
+    model_type = getattr(full_cfg, "model_type", "unknown")
     # Multimodal wrappers (e.g. qwen3_5) nest the decoder under text_config.
-    cfg = cfg.get_text_config()
+    cfg = full_cfg.get_text_config()
+    fp8_block = _fp8_block_size(full_cfg, cfg)
+    if dtype_str == "auto":
+        dtype_str = _native_half_dtype(cfg, full_cfg)
+    dtype = getattr(torch, dtype_str, torch.float16)
+    LOGGER.info("shard_dtype", extra={"weight_dtype": dtype_str})
     num_layers = int(getattr(cfg, "num_hidden_layers", 0) or getattr(cfg, "n_layer", 0))
     if num_layers <= 0:
         raise ValueError(f"Could not determine layer count for {model_id}")
@@ -143,10 +152,10 @@ def shard_model_by_layer(
     expert_bytes_total = 0
     has_experts = False
     for i in range(num_layers):
-        layer_state = _read_prefixed(weight_map, f"{layer_prefix}{i}.", dtype)
+        layer_state = _read_prefixed(weight_map, f"{layer_prefix}{i}.", dtype, fp8_block)
         if not layer_state:
             raise ValueError(f"No weights found for layer {i} ({layer_prefix}{i}.*)")
-        # Phase 25: MoE expert tensors go to a separate bank file so the dense
+        # MoE expert tensors go to a separate bank file so the dense
         # stream never re-reads expert bytes and experts can be range-read.
         from .expert_bank import split_expert_tensors
 
@@ -158,7 +167,7 @@ def shard_model_by_layer(
             bank_bytes = bank_path.stat().st_size
             total_bytes += bank_bytes
             expert_bytes_total += bank_bytes
-        # Phase 17: write as .safetensors for zero-copy mmap loading.
+        # Write as .safetensors for zero-copy mmap loading.
         layer_path = output_path / f"layer_{i:03d}.safetensors"
         _save_safetensors(dense_state, layer_path)
         layer_bytes = layer_path.stat().st_size
@@ -172,12 +181,20 @@ def shard_model_by_layer(
             progress(i + 1, num_layers, layer_bytes / 1e6)
         del layer_state
 
-    _stream_save_embed(weight_map, output_path / "embed.pt", is_gpt2, dtype, text_prefix)
+    _stream_save_embed(weight_map, output_path / "embed.pt", is_gpt2, dtype, text_prefix,
+                       fp8_block)
     LOGGER.info("shard_saved_embed")
-    _stream_save_lm_head(weight_map, output_path / "lm_head.pt", dtype, text_prefix)
+    _stream_save_lm_head(weight_map, output_path / "lm_head.pt", dtype, text_prefix,
+                         fp8_block)
     LOGGER.info("shard_saved_lm_head")
+    # Native multi-token-prediction head (Qwen3.5/3.8): resident draft layer
+    # for self-speculative decoding (runner/mtp.py). HF drops these weights.
+    mtp_state = _read_prefixed(weight_map, "mtp.", dtype, fp8_block)
+    if mtp_state:
+        _save_safetensors(mtp_state, output_path / MTP_FILE)
+        LOGGER.info("shard_saved_mtp", extra={"tensors": len(mtp_state)})
 
-    # Phase 25 (round-1 audit): num_experts is also readable from routed-expert
+    # num_experts is also readable from routed-expert
     # configs that do not use the plain "num_experts" spelling.
     num_experts = int(
         getattr(cfg, "num_experts", 0)
@@ -187,7 +204,7 @@ def shard_model_by_layer(
     top_k = int(getattr(cfg, "num_experts_per_tok", 0) or 0)
     if has_experts and num_experts == 0:
         # Config lacked expert fields (unusual layout) — derive from layer 0.
-        first = _read_prefixed(weight_map, f"{layer_prefix}0.", dtype)
+        first = _read_prefixed(weight_map, f"{layer_prefix}0.", dtype, fp8_block)
         from .expert_bank import expert_count as _expert_count
 
         num_experts = _expert_count(first)
@@ -214,6 +231,8 @@ def shard_model_by_layer(
         embed_file="embed.pt",
         lm_head_file="lm_head.pt",
         model_type=model_type,
+        weight_dtype=dtype_str,
+        source_quant="fp8" if fp8_block else "",
         shard_format="safetensors",
         num_experts=num_experts,
         top_k=top_k,
@@ -365,44 +384,109 @@ def _build_weight_map(local_path: Path) -> dict[str, Path]:
     return mapping
 
 
-def _read_prefixed(weight_map: dict[str, Path], prefix: str, dtype) -> dict:
+_FP8_SCALE_SUFFIX = "_scale_inv"
+
+
+def _fp8_block_size(*cfgs) -> tuple[int, int] | None:
+    """Block size of a block-FP8 checkpoint (dequantized at shard time); None
+    for unquantized ones. Other quantized formats are refused: casting their
+    packed weights would silently produce garbage shards."""
+    for cfg in cfgs:
+        q = getattr(cfg, "quantization_config", None)
+        if not q:
+            continue
+        q = q if isinstance(q, dict) else q.to_dict()
+        if q.get("quant_method") == "fp8" and q.get("weight_block_size"):
+            b = q["weight_block_size"]
+            return int(b[0]), int(b[1])
+        raise ValueError(
+            f"{q.get('quant_method', 'this')}-quantized checkpoint: SWLP shards "
+            "full-precision (bf16/fp16) or block-FP8 checkpoints — pull the "
+            "unquantized repo, or run an MLX-format repo directly"
+        )
+    return None
+
+
+def _native_half_dtype(*cfgs) -> str:
+    """The checkpoint's own half-precision dtype ("bfloat16" | "float16").
+
+    bf16 -> fp16 is not lossless: fp16 loses values below 2**-17 and overflows
+    above 65504 (Gated-DeltaNet state does), so bf16 checkpoints stay bf16.
+    Anything else (fp32, unknown) shards to float16 as before.
+    """
+    for cfg in cfgs:  # text config first, then the multimodal wrapper
+        native = getattr(cfg, "dtype", None) or getattr(cfg, "torch_dtype", None)
+        name = str(native).replace("torch.", "") if native is not None else ""
+        if name in ("bfloat16", "float16"):
+            return name
+    return "float16"
+
+
+def _read_prefixed(weight_map: dict[str, Path], prefix: str, dtype,
+                   fp8_block: tuple[int, int] | None = None) -> dict:
     """Read all tensors whose key starts with ``prefix``, keyed by the
-    prefix-stripped (block-relative) name and cast to ``dtype``."""
+    prefix-stripped (block-relative) name and cast to ``dtype``. FP8 weights
+    are dequantized with their ``*_scale_inv`` block scales first."""
     from safetensors import safe_open
 
     by_file: dict[Path, list[str]] = {}
     for key in weight_map:
         if key.startswith(prefix):
             by_file.setdefault(weight_map[key], []).append(key)
-
-    state: dict = {}
-    for fpath, fkeys in by_file.items():
+    raw: dict = {}
+    for fpath, fkeys in by_file.items():  # one open per file, not per tensor
         with safe_open(str(fpath), framework="pt", device="cpu") as handle:
             for key in fkeys:
-                state[key[len(prefix):]] = handle.get_tensor(key).to(dtype)
-    return state
+                raw[key[len(prefix):]] = handle.get_tensor(key)
+    return {name: _dequantized(name, t, raw, dtype, fp8_block)
+            for name, t in raw.items() if not name.endswith(_FP8_SCALE_SUFFIX)}
 
 
-def _read_one(weight_map: dict[str, Path], key: str, dtype):
+def _read_one(weight_map: dict[str, Path], key: str, dtype,
+              fp8_block: tuple[int, int] | None = None):
     """Read a single tensor by exact key; return None if the key is absent."""
+    if key not in weight_map:
+        return None
+    raw = {key: _get_tensor(weight_map, key)}
+    scale_key = key + _FP8_SCALE_SUFFIX
+    if scale_key in weight_map:
+        raw[scale_key] = _get_tensor(weight_map, scale_key)
+    return _dequantized(key, raw[key], raw, dtype, fp8_block)
+
+
+def _get_tensor(weight_map: dict[str, Path], key: str):
     from safetensors import safe_open
 
-    fpath = weight_map.get(key)
-    if fpath is None:
-        return None
-    with safe_open(str(fpath), framework="pt", device="cpu") as handle:
-        return handle.get_tensor(key).to(dtype)
+    with safe_open(str(weight_map[key]), framework="pt", device="cpu") as handle:
+        return handle.get_tensor(key)
+
+
+def _dequantized(name: str, tensor, raw: dict, dtype, fp8_block: tuple[int, int] | None):
+    """``tensor`` cast to ``dtype``; block-FP8 weights (DeepSeek/Qwen "fp8"
+    format: e4m3 values + one ``weight_scale_inv`` per block) are multiplied by
+    their block scale in fp32 first. Casting the raw FP8 values alone yields
+    weights up to 448 — the e4m3 maximum — i.e. garbage."""
+    scale = raw.get(name + _FP8_SCALE_SUFFIX)
+    if scale is None:
+        return tensor.to(dtype)
+    if fp8_block is None:
+        raise ValueError(f"{name}: FP8 scales present but no weight_block_size in the config")
+    rows, cols = tensor.shape
+    b_rows, b_cols = fp8_block
+    full = scale.float().repeat_interleave(b_rows, 0)[:rows].repeat_interleave(b_cols, 1)[:, :cols]
+    return (tensor.float() * full).to(dtype)
 
 
 def _stream_save_embed(
-    weight_map: dict[str, Path], path: Path, is_gpt2: bool, dtype, text_prefix: str = "model."
+    weight_map: dict[str, Path], path: Path, is_gpt2: bool, dtype, text_prefix: str = "model.",
+    fp8_block: tuple[int, int] | None = None,
 ) -> None:
     import torch
 
     state: dict = {}
     if is_gpt2:
-        wte = _read_one(weight_map, "transformer.wte.weight", dtype)
-        wpe = _read_one(weight_map, "transformer.wpe.weight", dtype)
+        wte = _read_one(weight_map, "transformer.wte.weight", dtype, fp8_block)
+        wpe = _read_one(weight_map, "transformer.wpe.weight", dtype, fp8_block)
         if wte is not None:
             state["wte"] = {"weight": wte}
         if wpe is not None:
@@ -411,8 +495,8 @@ def _stream_save_embed(
         # shard — persist it here, or the loader materialises it from
         # uninitialized (freshly zeroed) memory: first-run zero logits.
         ln_f: dict = {}
-        ln_w = _read_one(weight_map, "transformer.ln_f.weight", dtype)
-        ln_b = _read_one(weight_map, "transformer.ln_f.bias", dtype)
+        ln_w = _read_one(weight_map, "transformer.ln_f.weight", dtype, fp8_block)
+        ln_b = _read_one(weight_map, "transformer.ln_f.bias", dtype, fp8_block)
         if ln_w is not None:
             ln_f["weight"] = ln_w
         if ln_b is not None:
@@ -420,8 +504,8 @@ def _stream_save_embed(
         if ln_f:
             state["ln_f"] = ln_f
     else:
-        embed = _read_one(weight_map, f"{text_prefix}embed_tokens.weight", dtype)
-        norm = _read_one(weight_map, f"{text_prefix}norm.weight", dtype)
+        embed = _read_one(weight_map, f"{text_prefix}embed_tokens.weight", dtype, fp8_block)
+        norm = _read_one(weight_map, f"{text_prefix}norm.weight", dtype, fp8_block)
         if embed is not None:
             state["embed_tokens"] = {"weight": embed}
         if norm is not None:
@@ -430,52 +514,26 @@ def _stream_save_embed(
 
 
 def _stream_save_lm_head(
-    weight_map: dict[str, Path], path: Path, dtype, text_prefix: str = "model."
+    weight_map: dict[str, Path], path: Path, dtype, text_prefix: str = "model.",
+    fp8_block: tuple[int, int] | None = None,
 ) -> None:
     import torch
 
     # Untied models expose lm_head.weight directly; tied models reuse the input
     # embedding — fall back to it so the lm_head shard is always populated.
-    weight = _read_one(weight_map, "lm_head.weight", dtype)
+    weight = _read_one(weight_map, "lm_head.weight", dtype, fp8_block)
     if weight is None:
-        weight = _read_one(weight_map, f"{text_prefix}embed_tokens.weight", dtype)
+        weight = _read_one(weight_map, f"{text_prefix}embed_tokens.weight", dtype, fp8_block)
     if weight is None:
-        weight = _read_one(weight_map, "transformer.wte.weight", dtype)
+        weight = _read_one(weight_map, "transformer.wte.weight", dtype, fp8_block)
     torch.save({"weight": weight} if weight is not None else {}, path)
 
 
 def _save_safetensors(state_dict: dict, path: Path) -> None:
-    """Write a layer state_dict to a .safetensors file.
-
-    Handles two cases:
-    - **Plain FP16/FP32** — a flat ``{name: tensor}`` dict is saved directly.
-    - **FP8 quant** — the nested ``{"__swlp_quant__": "float8", "weights": ...}``
-      format produced by ``quantize_layer_state()`` is flattened:
-      2-D weights → ``{name}__fp8_data`` (fp8 tensor) + ``{name}__fp8_scale`` (fp16
-      scale); 1-D biases → ``{name}`` (fp16, no scale). The scheme is stored in
-      the safetensors metadata so ``_read_shard`` can reconstruct the nested format.
-    """
+    """Write a flat ``{name: tensor}`` layer state_dict to a .safetensors file."""
     import torch
     from safetensors.torch import save_file as _st_save
 
-    # Detect FP8 quant dicts (produced by quantize_layer_state("float8")).
-    # _QUANT_KEY = "_swlp_quant" (single underscore, defined in quant.py).
-    quant_scheme = state_dict.get("_swlp_quant", "")
-    if isinstance(state_dict.get("weights"), dict) and quant_scheme:
-        flat: dict[str, torch.Tensor] = {}
-        metadata: dict[str, str] = {"__swlp_quant__": str(quant_scheme)}
-        for name, entry in state_dict["weights"].items():
-            data = entry["data"].contiguous().cpu()
-            if "scale" in entry:
-                flat[f"{name}__fp8_data"] = data
-                flat[f"{name}__fp8_scale"] = entry["scale"].contiguous().cpu()
-            else:
-                # 1-D tensor (no scale) — stored directly.
-                flat[name] = data
-        _st_save(flat, str(path), metadata=metadata)
-        return
-
-    # Plain tensor dict (FP16/FP32 layer shards).
     safe_state: dict[str, torch.Tensor] = {}
     for k, v in state_dict.items():
         if not isinstance(v, torch.Tensor):
@@ -501,6 +559,8 @@ def _write_manifest(output_path: Path, manifest: ShardManifest) -> None:
         "num_experts": manifest.num_experts,
         "top_k": manifest.top_k,
         "expert_bank": manifest.expert_bank,
+        "expert_weight_mb": manifest.expert_weight_mb,
+        "source_quant": manifest.source_quant,
     }
     (output_path / MANIFEST_FILE).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -508,7 +568,12 @@ def _write_manifest(output_path: Path, manifest: ShardManifest) -> None:
 def load_manifest(shard_dir: str | Path) -> ShardManifest:
     path = Path(shard_dir) / MANIFEST_FILE
     data = json.loads(path.read_text(encoding="utf-8"))
-    return ShardManifest(**data)
+    manifest = ShardManifest(**data)
+    if manifest.weight_dtype == "float8":
+        raise ValueError(
+            f"{shard_dir}: FP8 shards are no longer supported; re-shard with `swlp pull`"
+        )
+    return manifest
 
 
 def get_layer_path(
@@ -669,7 +734,7 @@ def verify_shards(shard_dir: str | Path) -> ShardIntegrityReport:
             missing.append(expected.name)
         elif not _shard_file_ok(layer_path):
             corrupt.append(layer_path.name)
-        # Phase 25: expert banks are separate files the loader range-reads.
+        # Expert banks are separate files the loader range-reads.
         if manifest.expert_bank:
             bank = shard_path / f"layer_{i:03d}.experts.safetensors"
             if not bank.is_file():

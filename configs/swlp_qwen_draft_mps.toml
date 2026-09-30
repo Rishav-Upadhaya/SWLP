@@ -8,7 +8,7 @@
 #
 # The draft model MUST share the target's tokenizer (same Qwen2.5 family).
 # KV compression is intentionally OFF: the speculative path needs a plain,
-# rollback-capable DynamicCache (see docs/phase5_design_decisions.md).
+# rollback-capable DynamicCache (see docs/ROADMAP.md, "Appendix: Phase 5 design decisions").
 
 [model]
 model_id = "Qwen/Qwen2.5-14B-Instruct"
@@ -40,8 +40,6 @@ profile = true
 swlp_window_size = 2
 swlp_prefetch_depth = 2
 swlp_prefetch = true
-swlp_double_buffer = false
-swlp_pin_memory = false
 swlp_fallback_to_baseline = false
 kv_memory_budget_mb = 4096
 kv_compression = false

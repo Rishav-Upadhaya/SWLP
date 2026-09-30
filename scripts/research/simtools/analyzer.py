@@ -5,7 +5,7 @@ human-readable analysis report with observation→diagnosis→recommendation
 chains backed by measurable evidence.
 
 Usage:
-    from swlp.core.analyzer import analyze_traces
+    from scripts.research.simtools.analyzer import analyze_traces
     report = analyze_traces("layer_traces.json")
     print(report.format())
 """
@@ -24,8 +24,8 @@ from typing import Any
 class Evidence:
     """A single measured fact supporting a diagnosis."""
 
-    label: str      # e.g. "Upload avg"
-    value: str      # e.g. "37.2 ms"
+    label: str  # e.g. "Upload avg"
+    value: str  # e.g. "37.2 ms"
     unit: str = ""  # e.g. "ms", "%", "GB"
 
 
@@ -33,9 +33,9 @@ class Evidence:
 class Diagnosis:
     """Observation → reasoning → conclusion chain."""
 
-    observation: str        # what was measured
+    observation: str  # what was measured
     evidence: list[Evidence] = field(default_factory=list)
-    diagnosis: str = ""     # why it happened
+    diagnosis: str = ""  # why it happened
     severity: str = "info"  # "info" | "warning" | "critical"
     confidence: float = 0.0  # 0.0 - 1.0, how sure we are
 
@@ -48,7 +48,7 @@ class Recommendation:
     action: str
     reason: str
     expected_impact: str
-    category: str       # "config" | "code" | "hardware" | "experiment"
+    category: str  # "config" | "code" | "hardware" | "experiment"
     is_prediction: bool = False  # True = extrapolated, not measured
     confidence: float = 0.0
 
@@ -108,8 +108,8 @@ class AnalysisReport:
             lines.append("DIAGNOSES")
             lines.append("-" * 72)
             for i, d in enumerate(self.diagnoses, 1):
-                sev_icon = (
-                    {"critical": "!!!", "warning": " ! ", "info": " i "}.get(d.severity, "   ")
+                sev_icon = {"critical": "!!!", "warning": " ! ", "info": " i "}.get(
+                    d.severity, "   "
                 )
                 lines.append("")
                 lines.append(f"  [{sev_icon}] Diagnosis #{i}: {d.observation}")
@@ -272,8 +272,7 @@ def _analyze_prefetch(traces: list[dict], metrics: dict) -> Diagnosis:
     else:
         severity = "info"
         diag = (
-            f"Prefetch is effective — {hits}/{total} layers were ready "
-            f"before compute needed them."
+            f"Prefetch is effective — {hits}/{total} layers were ready before compute needed them."
         )
         conf = 0.95
 
@@ -364,16 +363,18 @@ def _analyze_memory(traces: list[dict], metrics: dict, hw: dict) -> list[Diagnos
         Evidence("Headroom", f"{headroom / 1e9:.2f}", "GB"),
     ]
 
-    diags.append(Diagnosis(
-        observation=f"Peak memory usage is {peak_pct:.0f}% of available RAM",
-        evidence=evidence,
-        diagnosis=(
-            f"Peak RSS is {peak_rss / 1e9:.2f} GB with {headroom / 1e9:.2f} GB headroom. "
-            f"macOS typically reserves 3-4 GB for kernel and services."
-        ),
-        severity="warning" if peak_pct > 85 else "info",
-        confidence=0.9,
-    ))
+    diags.append(
+        Diagnosis(
+            observation=f"Peak memory usage is {peak_pct:.0f}% of available RAM",
+            evidence=evidence,
+            diagnosis=(
+                f"Peak RSS is {peak_rss / 1e9:.2f} GB with {headroom / 1e9:.2f} GB headroom. "
+                f"macOS typically reserves 3-4 GB for kernel and services."
+            ),
+            severity="warning" if peak_pct > 85 else "info",
+            confidence=0.9,
+        )
+    )
 
     # Resident cache estimate
     num_layers = _i(hw.get("num_layers"))
@@ -395,17 +396,19 @@ def _analyze_memory(traces: list[dict], metrics: dict, hw: dict) -> list[Diagnos
                     Evidence("Available for resident", f"{available_for_resident / 1e9:.1f}", "GB"),
                     Evidence("Max resident layers", str(max_resident)),
                 ]
-                diags.append(Diagnosis(
-                    observation=f"~{max_resident} layers could fit in resident cache",
-                    evidence=est,
-                    diagnosis=(
-                        f"With {available_for_resident / 1e9:.1f} GB available and "
-                        f"~{layer_size_bytes / 1e6:.0f} MB per layer, up to {max_resident} "
-                        f"layers could stay resident without memory pressure."
-                    ),
-                    severity="info",
-                    confidence=0.65,  # estimate, not measured
-                ))
+                diags.append(
+                    Diagnosis(
+                        observation=f"~{max_resident} layers could fit in resident cache",
+                        evidence=est,
+                        diagnosis=(
+                            f"With {available_for_resident / 1e9:.1f} GB available and "
+                            f"~{layer_size_bytes / 1e6:.0f} MB per layer, up to {max_resident} "
+                            f"layers could stay resident without memory pressure."
+                        ),
+                        severity="info",
+                        confidence=0.65,  # estimate, not measured
+                    )
+                )
 
     return diags
 
@@ -562,14 +565,16 @@ def _generate_recommendations(
                 idle_pct = 0
 
             if idle_pct > 30:
-                recs.append(Recommendation(
-                    priority=priority,
-                    action="Increase prefetch depth or enable resident cache",
-                    reason=f"GPU idle {idle_pct:.0f}% — compute thread is starved for data",
-                    expected_impact="Reduce GPU idle by 10-20%, improve throughput",
-                    category="config",
-                    confidence=0.8,
-                ))
+                recs.append(
+                    Recommendation(
+                        priority=priority,
+                        action="Increase prefetch depth or enable resident cache",
+                        reason=f"GPU idle {idle_pct:.0f}% — compute thread is starved for data",
+                        expected_impact="Reduce GPU idle by 10-20%, improve throughput",
+                        category="config",
+                        confidence=0.8,
+                    )
+                )
                 priority += 1
 
         # Prefetch recommendations
@@ -580,24 +585,28 @@ def _generate_recommendations(
                 rate = 100
 
             if rate < 70:
-                recs.append(Recommendation(
-                    priority=priority,
-                    action="Increase prefetch depth",
-                    reason=f"Hit rate only {rate:.0f}% — many layers require sync reads",
-                    expected_impact="Reduce sync fallbacks by 20-40%",
-                    category="config",
-                    confidence=0.85,
-                ))
+                recs.append(
+                    Recommendation(
+                        priority=priority,
+                        action="Increase prefetch depth",
+                        reason=f"Hit rate only {rate:.0f}% — many layers require sync reads",
+                        expected_impact="Reduce sync fallbacks by 20-40%",
+                        category="config",
+                        confidence=0.85,
+                    )
+                )
                 priority += 1
             elif rate > 95:
-                recs.append(Recommendation(
-                    priority=priority,
-                    action="Consider reducing prefetch depth to save RAM",
-                    reason=f"Hit rate {rate:.0f}% — depth may be higher than needed",
-                    expected_impact="Free RAM for resident cache or larger window",
-                    category="config",
-                    confidence=0.7,
-                ))
+                recs.append(
+                    Recommendation(
+                        priority=priority,
+                        action="Consider reducing prefetch depth to save RAM",
+                        reason=f"Hit rate {rate:.0f}% — depth may be higher than needed",
+                        expected_impact="Free RAM for resident cache or larger window",
+                        category="config",
+                        confidence=0.7,
+                    )
+                )
                 priority += 1
 
         # Bottleneck recommendations
@@ -605,26 +614,30 @@ def _generate_recommendations(
             for e in d.evidence:
                 if "Dominant non-compute" in e.label:
                     if "Upload" in e.value:
-                        recs.append(Recommendation(
-                            priority=priority,
-                            action="Increase upload worker count",
-                            reason="CPU→MPS upload is the dominant non-compute bottleneck",
-                            expected_impact=(
-                                "Overlap uploads more aggressively, reduce per-layer latency"
-                            ),
-                            category="config",
-                            confidence=d.confidence,
-                        ))
+                        recs.append(
+                            Recommendation(
+                                priority=priority,
+                                action="Increase upload worker count",
+                                reason="CPU→MPS upload is the dominant non-compute bottleneck",
+                                expected_impact=(
+                                    "Overlap uploads more aggressively, reduce per-layer latency"
+                                ),
+                                category="config",
+                                confidence=d.confidence,
+                            )
+                        )
                         priority += 1
                     elif "SSD Read" in e.value:
-                        recs.append(Recommendation(
-                            priority=priority,
-                            action="Increase prefetch depth to overlap more SSD reads",
-                            reason="SSD read is the dominant non-compute bottleneck",
-                            expected_impact="More read/compute overlap",
-                            category="config",
-                            confidence=d.confidence,
-                        ))
+                        recs.append(
+                            Recommendation(
+                                priority=priority,
+                                action="Increase prefetch depth to overlap more SSD reads",
+                                reason="SSD read is the dominant non-compute bottleneck",
+                                expected_impact="More read/compute overlap",
+                                category="config",
+                                confidence=d.confidence,
+                            )
+                        )
                         priority += 1
 
         # Memory / resident cache recommendations
@@ -639,45 +652,51 @@ def _generate_recommendations(
 
             if max_resident >= 4:
                 target = min(max_resident, 8)
-                recs.append(Recommendation(
-                    priority=priority,
-                    action=f"Experiment with {target}-layer resident cache in simulator",
-                    reason=(
-                        f"~{max_resident} layers of headroom — resident cache "
-                        f"can skip SSD reads for early layers"
-                    ),
-                    expected_impact=(
-                        "Predicted 10-20% throughput improvement "
-                        "[prediction — validate with simulator]"
-                    ),
-                    category="experiment",
-                    is_prediction=True,
-                    confidence=0.6,
-                ))
+                recs.append(
+                    Recommendation(
+                        priority=priority,
+                        action=f"Experiment with {target}-layer resident cache in simulator",
+                        reason=(
+                            f"~{max_resident} layers of headroom — resident cache "
+                            f"can skip SSD reads for early layers"
+                        ),
+                        expected_impact=(
+                            "Predicted 10-20% throughput improvement "
+                            "[prediction — validate with simulator]"
+                        ),
+                        category="experiment",
+                        is_prediction=True,
+                        confidence=0.6,
+                    )
+                )
                 priority += 1
 
         # Queue saturation recommendations
         if "queues saturated" in (d.diagnosis or ""):
-            recs.append(Recommendation(
-                priority=priority,
-                action="Increase worker thread count",
-                reason="Worker pools are saturated — more workers would increase parallelism",
-                expected_impact="Better pipeline overlap",
-                category="config",
-                confidence=d.confidence,
-            ))
+            recs.append(
+                Recommendation(
+                    priority=priority,
+                    action="Increase worker thread count",
+                    reason="Worker pools are saturated — more workers would increase parallelism",
+                    expected_impact="Better pipeline overlap",
+                    category="config",
+                    confidence=d.confidence,
+                )
+            )
             priority += 1
 
     # Always recommend simulator sweeps
-    recs.append(Recommendation(
-        priority=priority,
-        action="Run simulator sweeps: swlp sim --resident 0,2,4,8,16 --window 2,4,6",
-        reason="Empirical sweep finds the Pareto-optimal config for your hardware",
-        expected_impact="Evidence-based configuration instead of guesswork",
-        category="experiment",
-        is_prediction=True,
-        confidence=0.5,
-    ))
+    recs.append(
+        Recommendation(
+            priority=priority,
+            action="Run simulator sweeps: swlp sim --resident 0,2,4,8,16 --window 2,4,6",
+            reason="Empirical sweep finds the Pareto-optimal config for your hardware",
+            expected_impact="Evidence-based configuration instead of guesswork",
+            category="experiment",
+            is_prediction=True,
+            confidence=0.5,
+        )
+    )
 
     return recs
 

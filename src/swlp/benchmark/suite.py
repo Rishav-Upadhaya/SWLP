@@ -12,6 +12,7 @@ import torch
 
 from ..config import AppConfig
 from ..runner.base import execute_baseline
+from .run import timestamped_path
 
 
 @dataclass(slots=True)
@@ -23,7 +24,6 @@ class SuiteConfig:
     window_sizes: list[int]
     prefetch_depths: list[int]
     prefetch_enabled: list[bool]
-    double_buffer_enabled: list[bool]
     kv_memory_budget_mb: list[int]
     kv_compression: list[bool]
     kv_tiering: list[bool]
@@ -38,7 +38,6 @@ class CaseResult:
     window_size: int | None
     prefetch_depth: int | None
     prefetch_enabled: bool | None
-    double_buffer_enabled: bool | None
     kv_memory_budget_mb: int | None
     kv_compression: bool | None
     kv_tiering: bool | None
@@ -74,7 +73,6 @@ def load_suite(path: Path) -> SuiteConfig:
         window_sizes=[int(value) for value in data.get("window_sizes", [1, 2, 4])],
         prefetch_depths=[int(value) for value in data.get("prefetch_depths", [1])],
         prefetch_enabled=[bool(value) for value in data.get("prefetch_enabled", [True])],
-        double_buffer_enabled=[bool(value) for value in data.get("double_buffer_enabled", [True])],
         kv_memory_budget_mb=[int(value) for value in data.get("kv_memory_budget_mb", [512])],
         kv_compression=[bool(value) for value in data.get("kv_compression", [False])],
         kv_tiering=[bool(value) for value in data.get("kv_tiering", [False])],
@@ -82,10 +80,7 @@ def load_suite(path: Path) -> SuiteConfig:
 
 
 def default_suite_path(format: str) -> Path:
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    directory = Path("benchmarks")
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"suite-{timestamp}.{format}"
+    return timestamped_path("benchmarks", "suite", format)
 
 
 def _token_overlap(a: str, b: str) -> float:
@@ -165,7 +160,6 @@ def run_suite(config: AppConfig, suite: SuiteConfig) -> SuiteResult:
                         window_size=None,
                         prefetch_depth=None,
                         prefetch_enabled=None,
-                        double_buffer_enabled=None,
                         kv_memory_budget_mb=None,
                         kv_compression=None,
                         kv_tiering=None,
@@ -180,63 +174,60 @@ def run_suite(config: AppConfig, suite: SuiteConfig) -> SuiteResult:
             for window_size in suite.window_sizes:
                 for prefetch_depth in suite.prefetch_depths:
                     for prefetch_enabled in suite.prefetch_enabled:
-                        for double_buffer_enabled in suite.double_buffer_enabled:
-                            for kv_budget in suite.kv_memory_budget_mb:
-                                for kv_compression in suite.kv_compression:
-                                    for kv_tiering in suite.kv_tiering:
-                                        swlp_config = replace(
-                                            config,
-                                            runtime=replace(
-                                                config.runtime,
-                                                backend="swlp",
-                                                profile=True,
-                                                swlp_fallback_to_baseline=False,
-                                                swlp_window_size=window_size,
-                                                swlp_prefetch_depth=prefetch_depth,
-                                                swlp_prefetch=prefetch_enabled,
-                                                swlp_double_buffer=double_buffer_enabled,
-                                                kv_memory_budget_mb=kv_budget,
-                                                kv_compression=kv_compression,
-                                                kv_tiering=kv_tiering,
-                                            ),
+                        for kv_budget in suite.kv_memory_budget_mb:
+                            for kv_compression in suite.kv_compression:
+                                for kv_tiering in suite.kv_tiering:
+                                    swlp_config = replace(
+                                        config,
+                                        runtime=replace(
+                                            config.runtime,
+                                            backend="swlp",
+                                            profile=True,
+                                            swlp_fallback_to_baseline=False,
+                                            swlp_window_size=window_size,
+                                            swlp_prefetch_depth=prefetch_depth,
+                                            swlp_prefetch=prefetch_enabled,
+                                            kv_memory_budget_mb=kv_budget,
+                                            kv_compression=kv_compression,
+                                            kv_tiering=kv_tiering,
+                                        ),
+                                    )
+                                    swlp_result = None
+                                    swlp_error = None
+                                    try:
+                                        swlp_result = execute_baseline(
+                                            swlp_config, prepared_prompt
                                         )
-                                        swlp_result = None
-                                        swlp_error = None
-                                        try:
-                                            swlp_result = execute_baseline(
-                                                swlp_config, prepared_prompt
-                                            )
-                                        except Exception as exc:
-                                            swlp_error = str(exc)
-                                        quality = None
-                                        if baseline_result and swlp_result:
-                                            quality = _token_overlap(
-                                                baseline_result.completion, swlp_result.completion
-                                            )
-                                        results.cases.append(
-                                            CaseResult(
-                                                suite=suite.name,
-                                                prompt=prepared_prompt,
-                                                context_length=context_length,
-                                                backend="swlp",
-                                                window_size=window_size,
-                                                prefetch_depth=prefetch_depth,
-                                                prefetch_enabled=prefetch_enabled,
-                                                double_buffer_enabled=double_buffer_enabled,
-                                                kv_memory_budget_mb=kv_budget,
-                                                kv_compression=kv_compression,
-                                                kv_tiering=kv_tiering,
-                                                kv_estimated_bytes_per_token=kv_bytes_per_token,
-                                                metrics=swlp_result.metrics.to_dict()
-                                                if swlp_result
-                                                else None,
-                                                completion=swlp_result.completion
-                                                if swlp_result
-                                                else None,
-                                                quality_overlap=quality,
-                                                error=swlp_error,
-                                            )
+                                    except Exception as exc:
+                                        swlp_error = str(exc)
+                                    quality = None
+                                    if baseline_result and swlp_result:
+                                        quality = _token_overlap(
+                                            baseline_result.completion, swlp_result.completion
                                         )
+                                    results.cases.append(
+                                        CaseResult(
+                                            suite=suite.name,
+                                            prompt=prepared_prompt,
+                                            context_length=context_length,
+                                            backend="swlp",
+                                            window_size=window_size,
+                                            prefetch_depth=prefetch_depth,
+                                            prefetch_enabled=prefetch_enabled,
+                                            kv_memory_budget_mb=kv_budget,
+                                            kv_compression=kv_compression,
+                                            kv_tiering=kv_tiering,
+                                            kv_estimated_bytes_per_token=kv_bytes_per_token,
+                                            metrics=swlp_result.metrics.to_dict()
+                                            if swlp_result
+                                            else None,
+                                            completion=swlp_result.completion
+                                            if swlp_result
+                                            else None,
+                                            quality_overlap=quality,
+                                            error=swlp_error,
+                                        )
+                                    )
 
     return results
 

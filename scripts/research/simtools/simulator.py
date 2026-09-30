@@ -29,7 +29,7 @@ workers are busy, new tasks queue and wait, creating the stalls that
 determine real-world throughput.
 
 Usage:
-    from swlp.core.simulator import SimulatorConfig, simulate
+    from scripts.research.simtools.simulator import SimulatorConfig, simulate
 
     config = SimulatorConfig(
         num_layers=32,
@@ -55,7 +55,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .profiler import LayerTrace, compute_pipeline_metrics
+from swlp.core.profiler import LayerTrace, compute_pipeline_metrics
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
@@ -140,7 +140,6 @@ class _ResourcePool:
         self._active.pop(layer, None)
 
 
-
 # ── Simulation state ───────────────────────────────────────────────────────
 
 
@@ -160,11 +159,11 @@ class _SimState:
         self.upload_pool = _ResourcePool("upload", config.worker_count)
 
         # Layer state
-        self.loaded: set[int] = set()          # layers with data on device
-        self.resident: set[int] = set()        # layers permanently resident
-        self.reading: set[int] = set()         # layers with SSD read in progress
-        self.uploading: set[int] = set()       # layers with upload in progress
-        self.queued_for_read: set[int] = set() # layers in SSD queue
+        self.loaded: set[int] = set()  # layers with data on device
+        self.resident: set[int] = set()  # layers permanently resident
+        self.reading: set[int] = set()  # layers with SSD read in progress
+        self.uploading: set[int] = set()  # layers with upload in progress
+        self.queued_for_read: set[int] = set()  # layers in SSD queue
         self.queued_for_upload: set[int] = set()
 
         # Ready queue: layers ready for GPU compute, in order
@@ -285,8 +284,10 @@ class _SimState:
         """If current layer is resident, mark it ready immediately."""
         if self.current_layer in self.resident and self.current_layer in self.loaded:
             # Only apply if not already in ready queue or computing
-            if (self.current_layer not in self.ready_queue and
-                self.current_layer not in self._computing):
+            if (
+                self.current_layer not in self.ready_queue
+                and self.current_layer not in self._computing
+            ):
                 self._add_event(self.current_time_ms, "resident_apply", self.current_layer)
 
     def _finish_simulation(self) -> None:
@@ -579,14 +580,16 @@ class SimResult:
             print("No traces recorded.")
             return
 
-        print(f"\n{'='*90}")
+        print(f"\n{'=' * 90}")
         print(f"PIPELINE TIMELINE — {len(traces)} layers, {self.wall_time_ms:.1f} ms total")
-        print(f"{'='*90}")
+        print(f"{'=' * 90}")
         print(
             f"{'Layer':>6} | {'Read':>8} | {'Upload':>8} | {'Ready':>8} | "
             f"{'Compute':>8} | {'Evict':>8} | {'Wait':>6} | Status"
         )
-        print(f"{'-'*6}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*6}-+-{'-'*10}")
+        print(
+            f"{'-' * 6}-+-{'-' * 8}-+-{'-' * 8}-+-{'-' * 8}-+-{'-' * 8}-+-{'-' * 8}-+-{'-' * 6}-+-{'-' * 10}"
+        )
 
         for t in traces:
             d = t.durations()
@@ -596,15 +599,15 @@ class SimResult:
                 f"{d['evict_ms']:>7.1f} | {d['ensure_wait_ms']:>5.1f} | {t.overlap_status}"
             )
 
-        print(f"{'='*90}\n")
+        print(f"{'=' * 90}\n")
 
     def print_summary(self) -> None:
         metrics = compute_pipeline_metrics(
             self.traces, wall_time=self.wall_time_ms / 1000, num_tokens=self.tokens_processed
         )
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("SIMULATION SUMMARY")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
         print(
             f"  Config: {self.config.num_layers} layers, {self.config.layer_size_mb:.0f} MB/layer"
         )
@@ -630,15 +633,15 @@ class SimResult:
         print(f"    Hits:               {metrics.prefetch_hits}")
         print(f"    Waits:              {metrics.prefetch_waits}")
         print(f"    Misses:             {metrics.prefetch_misses}")
-        print(f"    Hit rate:           {metrics.prefetch_hit_rate*100:.1f}%")
+        print(f"    Hit rate:           {metrics.prefetch_hit_rate * 100:.1f}%")
         print()
-        print(f"  GPU efficiency:       {metrics.gpu_efficiency*100:.1f}%")
+        print(f"  GPU efficiency:       {metrics.gpu_efficiency * 100:.1f}%")
         print(f"  GPU busy:             {self.gpu_busy_ms:.1f} ms")
         print(f"  GPU idle (est):       {self.gpu_idle_ms:.1f} ms")
         print()
         print(f"  Peak RAM:             {self.peak_ram_mb:.0f} MB")
         print(f"  Resident layers:      {self.resident_count}")
-        print(f"{'='*70}\n")
+        print(f"{'=' * 70}\n")
 
 
 # ── Main entry point ──────────────────────────────────────────────────────

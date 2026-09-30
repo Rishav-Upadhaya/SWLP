@@ -24,7 +24,7 @@ class RunMetrics:
     forward_seconds: float | None = None
     generate_seconds: float | None = None
     total_seconds: float | None = None
-    # Phase 15: prefill_seconds = time for the forward sweep over all input tokens
+    # Prefill_seconds = time for the forward sweep over all input tokens
     # (from generation_start to first logit).  time_to_first_token_seconds is the
     # user-perceived TTFT = prefill_seconds + argmax_seconds.
     prefill_seconds: float | None = None

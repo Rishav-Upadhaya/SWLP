@@ -1,17 +1,15 @@
-"""``swlp doctor`` — hardware-aware scheduling diagnosis.
+"""``swlp doctor`` — what this Mac can run, how, and how to tune it.
 
-Probes hardware, measures pipeline characteristics, predicts best-observed
-resident cache configuration, and explains every decision.
-
-Architecture:
-    Hardware Probe → Pipeline Model → Resident Policy → Residency Planner → Doctor Output
+One screen: the machine (chip, RAM, GPU working set, SSD), a table of models
+with how each would run *here* and the exact command, and the Apple Silicon
+tuning levers. Speeds are shown only where they were measured on an M5 16 GB.
 """
 from __future__ import annotations
 
-from .cli_args import MODEL_ALIASES
+from . import ui
 from .hardware.detect import HardwareInfo, detect_hardware, fits_in_memory
 
-# Approximate FP16 disk size per alias (GB)
+# Approximate FP16 disk size per alias (GB).
 KNOWN_FP16_GB: dict[str, float] = {
     "smollm-360m": 0.72,
     "qwen-0.5b": 1.0,
@@ -25,7 +23,7 @@ KNOWN_FP16_GB: dict[str, float] = {
     "mistral-24b": 44.0,
 }
 
-# Approximate layer counts and sizes for known models
+# Layer count and per-layer MB (used by scripts/collect_cross_machine.py).
 MODEL_LAYERS: dict[str, tuple[int, float]] = {
     "smollm-360m": (24, 30.0),
     "qwen-0.5b": (24, 42.0),
@@ -39,121 +37,117 @@ MODEL_LAYERS: dict[str, tuple[int, float]] = {
     "mistral-24b": (40, 1100.0),
 }
 
-_GB = 1024 ** 3
-
-# Phase 25/27: MoE models runnable via expert-selective streaming. Disk size is
-# the as-shipped checkpoint; "active" params drive per-token streamed bytes.
-# Miss-rate guidance follows FreeToken's measured LRU curve (arXiv:2608.16157):
-# ~30% miss at ~4% of the expert pool cached, ~16% at ~11%.
+# MoE models: as-shipped size and how SWLP runs them (expert streaming).
 MOE_MODELS: dict[str, dict[str, object]] = {
-    "qwen3-30b-a3b": {
-        "hf_id": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-        "disk_gb": 61.0, "active_b": 3.4, "experts": 128, "top_k": 8,
-        "note": "best first MoE target — fine-grained routing, 3.4B active",
-    },
-    "mixtral-8x7b": {
-        "hf_id": "mistralai/Mixtral-8x7B-Instruct-v0.1",
-        "disk_gb": 93.0, "active_b": 12.9, "experts": 8, "top_k": 2,
-        "note": "coarse top-2-of-8 routing streams ~1/4 of every layer",
-    },
-    "deepseek-v4-flash": {
-        "hf_id": "deepseek-ai/DeepSeek-V4-Flash-0731",
-        "disk_gb": 142.0, "active_b": 13.0, "experts": 256, "top_k": 6,
-        "note": "284B MXFP4 — feasibility class, not interactive speed",
-    },
+    "gemma4-26b": {"disk_gb": 15.3, "precision": "4-bit", "prepared": True},
+    "olmoe-7b": {"disk_gb": 13.8, "precision": "bf16", "prepared": False},
+    "qwen3-30b-a3b": {"disk_gb": 61.0, "precision": "bf16", "prepared": False},
+    "qwen3.6-35b": {"disk_gb": 72.0, "precision": "bf16", "prepared": False},
+    "mixtral-8x7b": {"disk_gb": 93.0, "precision": "bf16", "prepared": False},
+    "deepseek-v4-flash": {"disk_gb": 142.0, "precision": "mxfp4", "prepared": False},
 }
 
+# Steady-state decode measured on an Apple M5 16 GB (docs/ROADMAP.md,
+# Phases 29–31). Everything else shows "—": no guesses in this table.
+MEASURED_M5_16GB: dict[str, str] = {
+    "gemma4-26b": "14.5",
+    "olmoe-7b": "12.5",
+    "qwen3.6-35b": "4.5–5.0",
+}
 
-def recommend_command(alias: str, size_gb: float, hw: HardwareInfo) -> str:
-    """Return the recommended ``swlp`` command for one model on this hardware."""
+_GB = 1024 ** 3
+
+
+def recommend(alias: str, size_gb: float, hw: HardwareInfo,
+              installed: frozenset[str] = frozenset()) -> tuple[str, str]:
+    """``(how it runs on this machine, the command to type)``; installed models
+    (``swlp models``) are ready to chat, the rest need ``swlp pull`` first."""
     if alias in MOE_MODELS:
-        return f"swlp run {alias} --prompt \"...\"  # expert-streamed MoE"
+        info = MOE_MODELS[alias]
+        ready = info["prepared"] or alias in installed
+        return (f"MoE experts · {info['precision']}",
+                f"swlp chat {alias}" if ready else f"swlp pull {alias}")
+    if alias in installed:
+        return "layer streaming", f"swlp chat {alias}"
     mlx_ready = hw.unified_memory and hw.preferred_backend == "mlx"
-    if mlx_ready and fits_in_memory(int(size_gb / 2 * _GB), hw):
-        return f"swlp run {alias} --backend mlx --quant int8 --prompt \"...\""
-    return f"swlp run {alias} --prompt \"...\""
+    for quant, bytes_per_fp16 in (("int8", 0.5), ("int4", 0.25)):
+        if mlx_ready and fits_in_memory(int(size_gb * bytes_per_fp16 * _GB), hw):
+            return f"MLX {quant}", f"swlp chat {alias} -q {quant}"
+    return "layer streaming", f"swlp pull {alias}"
 
 
-def _apple_tuning_lines(hw: HardwareInfo) -> list[str]:
-    """Apple-specific levers, with the exact commands to pull them.
+def plan_rows(hw: HardwareInfo, only: str | None = None) -> list[list[str]]:
+    """The "what you can run" table: model · size · how · speed · command."""
+    from .cli_models import installed_models
 
-    This is the most actionable part of the report on a Mac: the Metal wired
-    ceiling decides whether a model is resident or swapping, and swapping is
-    the difference between usable and unusable.
-    """
+    installed = frozenset(name for name, *_ in installed_models())
+    sizes = {**KNOWN_FP16_GB, **{a: float(i["disk_gb"]) for a, i in MOE_MODELS.items()}}
+    rows = []
+    for alias, size in sorted(sizes.items(), key=lambda kv: kv[1]):
+        if only and alias != only:
+            continue
+        how, cmd = recommend(alias, size, hw, installed)
+        rows.append([alias, f"{size:.0f} GB" if size >= 1 else f"{size:.1f} GB", how,
+                     MEASURED_M5_16GB.get(alias, "—"), cmd])
+    return rows
+
+
+def tuning_rows(hw: HardwareInfo) -> list[list[str]]:
+    """Apple Silicon levers: the Metal wired ceiling first (resident vs swapping)."""
     if not hw.unified_memory:
         return []
+    from .runner.mlx_tune import max_working_set_mb, sysctl_advice
 
-    from .runner.mlx_tune import (
-        max_working_set_mb,
-        recommended_wired_limit_mb,
-        sysctl_advice,
-    )
-
-    lines = ["APPLE SILICON TUNING", "─" * 72]
     cap_mb = max_working_set_mb()
-    want_mb = recommended_wired_limit_mb(hw.memory_gb)
-
+    rows = []
     if cap_mb is None:
-        lines.append("  Metal:           unavailable (install 'swlp[apple]' for MLX)")
+        rows.append(["GPU memory", "MLX not installed — pip install 'swlp[apple]'"])
     else:
-        pct = 100.0 * cap_mb / (hw.memory_gb * 1024)
-        lines.append(f"  GPU wired cap:   {cap_mb / 1024:.1f} GB  ({pct:.0f}% of RAM)")
-        wired_gb = min(cap_mb, want_mb) / 1024
-        lines.append(f"  SWLP will wire:  {wired_gb:.1f} GB  (auto, per process)")
-
+        pct = 100 * cap_mb / (hw.memory_gb * 1024)
+        rows.append(["GPU working set", f"{cap_mb / 1024:.1f} GB ({pct:.0f}% of RAM)"])
     advice = sysctl_advice(hw.memory_gb)
     if advice:
-        lines.extend([
-            "",
-            "  The GPU ceiling is below what this machine could give it.",
-            "  To raise it (needs sudo, resets on reboot, leaves macOS 4 GB):",
-            f"    {advice.split('   #')[0]}",
-        ])
+        rows.append(["raise it (sudo)", advice.split("   #")[0]])
+    rows += [
+        ["faster KV cache", "SWLP_MLX_KV_BITS=4  (4-bit KV is faster here, not slower)"],
+        ["speculative", "SWLP_DRAFT_MODEL=<small same-family model>  (1.9–2.1x)"],
+        ["MoE expert cache", "SWLP_EXPERT_CACHE_MB=<MB>  (default: free RAM, GPU-capped)"],
+    ]
+    return rows
+
+
+def print_doctor(model: str | None = None) -> None:
+    import psutil
+
+    hw = detect_hardware()
+    free_gb = psutil.virtual_memory().available / _GB
+    if not hw.unified_memory:
+        mlx = "n/a (Apple Silicon only)"
+    elif hw.preferred_backend == "mlx":
+        mlx = "installed"
     else:
-        lines.append("  Wired ceiling:   already at the safe maximum — nothing to do")
-
-    lines.extend([
-        "",
-        "  Throughput levers, highest payoff first:",
-        "    --quant int4            ~2x over int8; 4x less weight traffic",
-        "    --draft-model <small>   1.9-2.1x measured; same model family only",
-        "    --kv-bits 4             4-bit KV is FASTER than fp16 here, not slower",
-        "                            (decode is bandwidth-bound; arXiv:2605.05699)",
-        "    --max-kv-size <n>       caps long-context RAM (lossy: drops oldest)",
-        "",
+        mlx = "not installed — pip install 'swlp[apple]'"
+    ui.header("swlp doctor", [
+        ("chip", hw.chip_name),
+        ("memory", f"{hw.memory_gb:.0f} GB unified · {free_gb:.1f} GB free now"),
+        ("SSD", f"{hw.ssd_bandwidth_gbps:.1f} GB/s"),
+        ("MLX", mlx),
     ])
-    return lines
-
-
-def _moe_advisory_lines(hw: HardwareInfo, free_ram_gb: float) -> list[str]:
-    """Phase 27: expert-cache guidance for MoE streaming targets."""
-    lines = [
-        "",
-        "MoE STREAMING (Phase 25 — expert-selective sweeps)",
-        "─" * 72,
-        f"  {'MODEL':<20}{'DISK':>7}{'ACTIVE':>8}{'CEIL t/s':>9}   ADVICE",
-    ]
-    # Mirrors the auto policy in runner/load.py (25% of available, 4 GB cap)
-    # so the advice and the implementation cannot disagree.
-    cache_mb = int(min(free_ram_gb * 0.25, 4.0) * 1024)
-    for alias, info in sorted(MOE_MODELS.items(), key=lambda kv: kv[1]["disk_gb"]):
-        active_gb = float(info["active_b"]) * 2.0  # FP16: 2 bytes/param, decimal GB
-        ceiling = hw.ssd_bandwidth_gbps / active_gb if active_gb > 0 else 0.0
-        lines.append(
-            f"  {alias:<20}{info['disk_gb']:>5.0f} GB{info['active_b']:>6.1f}B"
-            f"{ceiling:>9.2f}   {info['note']}"
-        )
-    lines += [
-        "",
-        f"  Expert cache: SWLP_EXPERT_CACHE_MB={cache_mb} matches the auto",
-        "  policy (25% of free RAM, 4 GB cap). FreeToken-measured LRU miss",
-        "  ≈30% at ~4% of the expert pool cached, ≈16% at ~11% — hit rate,",
-        "  not raw bandwidth, dominates MoE tok/s.",
-        "  SWLP_EXPERT_PREFETCH=predictive (default) records routing history.",
-        "  Sweep budgets on your machine: scripts/research/moe_sweep.py",
-    ]
-    return lines
+    rows = plan_rows(hw, only=model)
+    if model and not rows:
+        ui.note(f"\n  {model}: no size on record — "
+                f"try  swlp pull {model}  or  swlp chat {model} -q int4")
+    else:
+        ui.console.print()
+        ui.table(["model", "size", "runs as", "M5 tok/s*", "command"], rows,
+                 title="What you can run")
+        ui.note("  * measured on an M5 16 GB (steady decode)  ·  after  swlp pull MODEL :  "
+                "swlp chat MODEL")
+    tuning = tuning_rows(hw)
+    if tuning:
+        ui.console.print()
+        ui.table(["", ""], tuning, title="Tuning")
+    ui.console.print()
 
 
 def _measure_pipeline_ratio(alias: str, hw: HardwareInfo) -> dict:
@@ -200,213 +194,3 @@ def _measure_pipeline_ratio(alias: str, hw: HardwareInfo) -> dict:
         "upload_ms": upload_ms,
         "compute_ms": compute_ms,
     }
-
-
-def _predict_resident(ratio: float, free_ram_gb: float, layer_size_mb: float) -> dict:
-    """Predict best-observed resident count with confidence."""
-    from .core.confidence import estimate_policy_confidence
-    from .core.resident_policy import estimate_optimal_resident_count
-
-    result = estimate_optimal_resident_count(ratio, free_ram_gb, layer_size_mb)
-    confidence = estimate_policy_confidence(
-        pipeline_ratio=ratio,
-        free_ram_gb=free_ram_gb,
-        measured_ratio=False,
-        has_layer_size=True,
-    )
-
-    return {
-        "resident_count": result.resident_count,
-        "raw_float": result.raw_float,
-        "memory_clamped": result.memory_clamped,
-        "in_grid_region": result.in_grid_region,
-        "confidence_score": confidence.score,
-        "confidence_level": confidence.level,
-        "reasons": confidence.reasons,
-        "factors": confidence.factors,
-    }
-
-
-def doctor_lines(hw: HardwareInfo, model: str | None = None) -> list[str]:
-    """Build the enhanced ``swlp doctor`` report."""
-    memory_kind = "unified" if hw.unified_memory else "system"
-    free_ram_gb = hw.memory_gb * 0.7  # rough estimate of free RAM
-
-    lines = [
-        "",
-        "  ╔" + "═" * 68 + "╗",
-        "  ║" + "SWLP DOCTOR".center(68) + "║",
-        "  ║" + "what this Mac can run, and how fast".center(68) + "║",
-        "  ╚" + "═" * 68 + "╝",
-        "",
-        "HARDWARE",
-        "─" * 72,
-        f"  Chip:            {hw.chip_name}",
-        f"  Memory:          {hw.memory_gb:.1f} GB ({memory_kind})",
-        f"  Device:          {hw.device_type}",
-        f"  SSD Bandwidth:   ~{hw.ssd_bandwidth_gbps:.1f} GB/s",
-    ]
-
-    # Add MLX status
-    mlx_ready = hw.unified_memory and hw.preferred_backend == "mlx"
-    if hw.unified_memory:
-        mlx_status = "installed" if mlx_ready else "not installed  (pip install 'swlp[apple]')"
-    else:
-        mlx_status = "n/a  (Apple Silicon only)"
-    lines.append(f"  MLX:             {mlx_status}")
-
-    # .swz compression advice from the measured Phase 22 crossover.
-    from .codec import recommend_compression
-    from .hardware.detect import _measured_ssd_bandwidth
-
-    measured = _measured_ssd_bandwidth()
-    if measured is not None:
-        if recommend_compression(measured):
-            lines.append(
-                f"  .swz Shards:     recommended — measured {measured:.1f} GB/s < 3.5 GB/s"
-                " crossover (`swlp compress-shards <dir>`)"
-            )
-        else:
-            lines.append(
-                f"  .swz Shards:     disk-only win — measured {measured:.1f} GB/s ≥ 3.5 GB/s"
-                " crossover (~25% tok/s cost; use only for disk space)"
-            )
-    else:
-        lines.append(
-            "  .swz Shards:     unknown — measure SSD first"
-            " (`python scripts/phase0_hardware_check.py`)"
-        )
-    lines.append("")
-
-    # Analyze each model (or just the specified one)
-    models_to_check = [model] if model else ["mistral-7b", "qwen-14b"]
-
-    for alias in models_to_check:
-        if alias not in KNOWN_FP16_GB:
-            continue
-
-        size_gb = KNOWN_FP16_GB[alias]
-        pipeline = _measure_pipeline_ratio(alias, hw)
-        prediction = _predict_resident(
-            pipeline["ratio"], free_ram_gb, pipeline["layer_size_mb"]
-        )
-
-        # Expected speedup (rough estimate based on pipeline ratio)
-        if pipeline["ratio"] > 3:
-            expected_speedup = 1.0 + (pipeline["ratio"] - 3) * 0.05
-            expected_speedup = min(expected_speedup, 3.0)
-        else:
-            expected_speedup = 1.0
-
-        # Memory usage
-        resident_gb = prediction["resident_count"] * pipeline["layer_size_mb"] / 1024
-        grid_region = "inside" if prediction["in_grid_region"] else "outside (extrapolated)"
-
-        lines.extend([
-            f"MODEL: {alias.upper()}",
-            "─" * 72,
-            f"  Layers:          {pipeline['layers']}",
-            f"  Layer size:      {pipeline['layer_size_mb']:.0f} MB",
-            f"  Total size:      {size_gb:.1f} GB",
-            "",
-            "MEASURED PIPELINE",
-            "─" * 72,
-            f"  SSD Read:        {pipeline['ssd_read_ms']:.0f} ms",
-            f"  Deserialize:     {pipeline['deserialize_ms']:.0f} ms",
-            f"  Upload:          {pipeline['upload_ms']:.0f} ms",
-            f"  Compute:         {pipeline['compute_ms']:.0f} ms",
-            f"  Pipeline Ratio:  {pipeline['ratio']:.2f}",
-            f"  Ratio source:    {pipeline['source']}",
-            "",
-            "PREDICTION",
-            "─" * 72,
-            f"  Resident Layers: {prediction['resident_count']}",
-            f"  Expected Speedup: {expected_speedup:.2f}x",
-            f"  Confidence:      {prediction['confidence_score']:.0%} "
-            f"({prediction['confidence_level']})",
-            f"  Memory Used:     {resident_gb:.1f} GB",
-            f"  Grid Region:     {grid_region}",
-            "",
-            "CONFIDENCE BREAKDOWN",
-            "─" * 72,
-            f"  {'Factor':<30} {'Impact':>8}",
-            f"  {'-'*30} {'-'*8}",
-        ])
-        for factor, impact in sorted(prediction["factors"].items(), key=lambda x: x[1]):
-            sign = "+" if impact >= 0 else ""
-            lines.append(f"  {factor:<30} {sign}{impact:.0%}")
-
-        lines.extend([
-            "",
-            "REASONING",
-            "─" * 72,
-        ])
-        for i, reason in enumerate(prediction["reasons"], 1):
-            lines.append(f"  {i}. {reason}")
-
-        lines.extend([
-            "",
-            "RECOMMENDATION",
-            "─" * 72,
-            f"  Use {prediction['resident_count']} resident layers for {alias}.",
-            f"  Command: swlp run {alias}  # auto-shards; "
-            f"--window {prediction['resident_count']} to pin residency",
-            "",
-        ])
-
-    lines.extend(_apple_tuning_lines(hw))
-
-    # Coverage summary
-    lines.extend(_moe_advisory_lines(hw, free_ram_gb))
-    lines.extend([
-        "COMMANDS",
-        "─" * 72,
-        f"  {'MODEL':<14}{'FP16':>7}   COMMAND",
-    ])
-    for alias, size_gb in sorted(KNOWN_FP16_GB.items(), key=lambda kv: kv[1]):
-        lines.append(f"  {alias:<14}{size_gb:>5.1f} GB  {recommend_command(alias, size_gb, hw)}")
-    for alias, info in sorted(MOE_MODELS.items(), key=lambda kv: kv[1]["disk_gb"]):
-        disk_gb = info["disk_gb"]
-        lines.append(f"  {alias:<14}{disk_gb:>5.0f} GB  {recommend_command(alias, disk_gb, hw)}")
-
-    lines.extend([
-        "",
-        "─" * 72,
-        "Run ``swlp doctor <model>`` for a specific model diagnosis.",
-        "Run ``swlp profile --shard-dir ./shards/<model> --max-tokens 3`` to validate.",
-        "",
-    ])
-
-    return lines
-
-
-def models_lines() -> list[str]:
-    """Build the ``swlp models`` alias reference table."""
-    lines = [
-        "Model aliases  (any other HuggingFace id also works)",
-        "─" * 72,
-        f"  {'ALIAS':<14}{'FP16':>7}   HUGGINGFACE ID",
-    ]
-    for alias, hf_id in sorted(MODEL_ALIASES.items(), key=lambda kv: KNOWN_FP16_GB.get(kv[0], 0)):
-        size_gb = KNOWN_FP16_GB.get(alias)
-        size = f"{size_gb:>5.1f} GB" if size_gb is not None else f"{'—':>8}"
-        lines.append(f"  {alias:<14}{size}  {hf_id}")
-    lines += [
-        "",
-        "All aliases support FP16 streaming (--shard-dir).  MLX (--backend mlx)",
-        "requires Apple Silicon.  Run  swlp doctor  for per-machine advice.",
-    ]
-    return lines
-
-
-def print_doctor(model: str | None = None) -> None:
-    """Detect hardware and print the doctor report."""
-    hw = detect_hardware()
-    for line in doctor_lines(hw, model):
-        print(line)
-
-
-def print_models() -> None:
-    """Print the model alias reference."""
-    for line in models_lines():
-        print(line)

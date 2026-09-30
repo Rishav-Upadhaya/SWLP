@@ -15,7 +15,6 @@ runs_per_case = 1
 window_sizes = [2, 4, 6]
 prefetch_depths = [2]
 prefetch_enabled = [true]
-double_buffer_enabled = [false]
 kv_memory_budget_mb = [4096]
 kv_compression = [false]
 kv_tiering = [false]

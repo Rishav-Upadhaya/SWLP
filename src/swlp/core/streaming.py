@@ -53,15 +53,12 @@ from queue import Empty, SimpleQueue
 import torch
 
 from .. import codec
-from ..model.quant import dequantize_layer_state
-from ..model.sparse import decode_sparse
 from .profiler import LayerProfiler
 from .scheduler import PrefetchError, SchedulerConfig
 from .shard_io import _read_file_nocache as _read_file_nocache  # noqa: PLC0414 — test surface
 from .shard_io import _safetensors_metadata as _safetensors_metadata  # noqa: PLC0414
 from .shard_io import (
     load_safetensors_shard,
-    nest_fp8_state,
     parse_safetensors_views,
     read_shard_mmap,
     read_shard_payload,
@@ -191,7 +188,7 @@ class StreamingScheduler:
         self.device = device
         self.config = config
         self.shard_dir = Path(shard_dir)
-        # Phase 26: shard striping across volumes. Layers are assigned
+        # Shard striping across volumes. Layers are assigned
         # round-robin to a volume; the read pool then parallelizes across
         # spindles/controllers (internal NVMe + TB4 external ≈ additive GB/s).
         # ``shard_dir`` stays the manifest root; volumes only widen where
@@ -224,7 +221,7 @@ class StreamingScheduler:
             thread_name_prefix="swlp-upload",
         )
         self._tls = threading.local()
-        # Read-buffer free-list (Phase 24 fix): a buffer is handed out by
+        # Read-buffer free-list: a buffer is handed out by
         # ``_read_and_deserialize`` and returns here only after its payload's
         # upload completed — reusing it earlier let a worker overwrite bytes
         # an in-flight upload still referenced, silently corrupting weights.
@@ -235,7 +232,7 @@ class StreamingScheduler:
         # pinned-buffer tier here: the "upload" is a dtype/device cast that
         # already shares physical pages with the read buffer.
         self._pin = False
-        # Overlap-tracking counters (Phase 11).
+        # Overlap-tracking counters.
         # hit  — ensure() found the prefetch future already done (full overlap).
         # wait — ensure() blocked on a still-running future (partial overlap).
         # miss — ensure() fell back to a synchronous read (no prefetch running).
@@ -255,7 +252,7 @@ class StreamingScheduler:
         return [self._volumes[i], *self._volumes[:i], *self._volumes[i + 1:]]
 
     def _shard_path(self, idx: int) -> Path | None:
-        # Auto-detect shard format by extension: .safetensors (Phase 17),
+        # Auto-detect shard format by extension: .safetensors,
         # compressed .safetensors.swz, then legacy .pt — probing the layer's
         # striped volume first, then the remaining volumes.
         for vol in self._volume_order(idx):
@@ -293,14 +290,12 @@ class StreamingScheduler:
             return None
 
     def _to_device_state(self, state: dict) -> dict[str, torch.Tensor]:
-        """Dequantize/decode and copy a shard state dict to the device.
+        """Copy a shard state dict to the device.
 
         ``copy=True`` is required: the source tensors may be views into a
         reused read buffer, and on same-device (CPU) targets ``.to`` without
         a copy would alias that buffer and be corrupted by the next read.
         """
-        state = dequantize_layer_state(state)
-        state = decode_sparse(state)  # Phase 13: no-op on dense shards
         out = {
             k: v.to(device=self.device, copy=True, non_blocking=self._pin)
             for k, v in state.items()
@@ -345,9 +340,7 @@ class StreamingScheduler:
                 if prof:
                     prof.end_read(idx)
                     prof.begin_deserialize(idx)
-                state, metadata = parse_safetensors_views(payload, size)
-                if metadata.get("__swlp_quant__", "") == "float8":
-                    state = nest_fp8_state(state)
+                state, _ = parse_safetensors_views(payload, size)
             else:
                 data = _read_file_nocache(path, nocache=self._direct_io)
                 if prof:
@@ -649,7 +642,7 @@ class StreamingScheduler:
                 active_reads=sum(1 for f in self._futures.values() if not f.done()),
                 active_uploads=0,
             )
-        # Phase 23 fix: never evict resident layers when the model fully fits
+        # Never evict resident layers when the model fully fits
         # in RAM.  Evicting forces a CPU→MPS re-apply + load_state_dict on
         # the next ensure(), which is pure Python overhead on unified memory.
         # When all layers are resident, keeping them on-device eliminates

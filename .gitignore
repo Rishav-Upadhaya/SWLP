@@ -149,3 +149,7 @@ graphify-out/
 # profiler / simulator output artifacts
 layer_traces.json
 sim_traces.json
+
+# Local experiment outputs and tool lockfiles (requirements.txt is the reproducibility lock)
+/experiments/
+uv.lock

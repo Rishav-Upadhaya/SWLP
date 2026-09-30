@@ -10,6 +10,7 @@ Usage:
 
 Defaults mirror DeepSeek-V4-Flash: 256 experts x ~12.7 MB.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -42,29 +43,60 @@ def build_bank(root: Path, num_experts: int, expert_mb: float) -> Path:
     gu_bytes = 2 * intermediate * hidden * 2
     dn_bytes = hidden * intermediate * 2
     header = {
-        "experts.gate_up_proj": {"dtype": "F16", "shape": [num_experts, 2 * intermediate, hidden],
-                                 "data_offsets": [0, num_experts * gu_bytes]},
-        "experts.down_proj": {"dtype": "F16", "shape": [num_experts, hidden, intermediate],
-                              "data_offsets": [num_experts * gu_bytes,
-                                               num_experts * (gu_bytes + dn_bytes)]},
+        "experts.gate_up_proj": {
+            "dtype": "F16",
+            "shape": [num_experts, 2 * intermediate, hidden],
+            "data_offsets": [0, num_experts * gu_bytes],
+        },
+        "experts.down_proj": {
+            "dtype": "F16",
+            "shape": [num_experts, hidden, intermediate],
+            "data_offsets": [num_experts * gu_bytes, num_experts * (gu_bytes + dn_bytes)],
+        },
     }
     data_start = 8 + len(json.dumps(header).encode())
     slices = []
     for j in range(num_experts):
         base = data_start + j * gu_bytes
         half = gu_bytes // 2
-        slices.append([
-            {"slot": "gate", "offset": base, "nbytes": half,
-             "dtype": "F16", "rows": intermediate, "cols": hidden},
-            {"slot": "up", "offset": base + half, "nbytes": half,
-             "dtype": "F16", "rows": intermediate, "cols": hidden},
-            {"slot": "down", "offset": data_start + num_experts * gu_bytes + j * dn_bytes,
-             "nbytes": dn_bytes, "dtype": "F16", "rows": hidden, "cols": intermediate},
-        ])
-    index = {"0": {"bank_file": "layer_000.experts.safetensors",
-                   "num_experts": num_experts, "dtype": "F16",
-                   "hidden": hidden, "intermediate": intermediate,
-                   "slices": slices}}
+        slices.append(
+            [
+                {
+                    "slot": "gate",
+                    "offset": base,
+                    "nbytes": half,
+                    "dtype": "F16",
+                    "rows": intermediate,
+                    "cols": hidden,
+                },
+                {
+                    "slot": "up",
+                    "offset": base + half,
+                    "nbytes": half,
+                    "dtype": "F16",
+                    "rows": intermediate,
+                    "cols": hidden,
+                },
+                {
+                    "slot": "down",
+                    "offset": data_start + num_experts * gu_bytes + j * dn_bytes,
+                    "nbytes": dn_bytes,
+                    "dtype": "F16",
+                    "rows": hidden,
+                    "cols": intermediate,
+                },
+            ]
+        )
+    index = {
+        "0": {
+            "bank_file": "layer_000.experts.safetensors",
+            "num_experts": num_experts,
+            "dtype": "F16",
+            "hidden": hidden,
+            "intermediate": intermediate,
+            "slices": slices,
+        }
+    }
     (root / "expert_index.json").write_text(json.dumps(index))
     return root
 
@@ -87,8 +119,9 @@ def main() -> int:
     parser.add_argument("--experts", type=int, default=256)
     parser.add_argument("--bytes-per-expert-mb", type=float, default=12.7)
     parser.add_argument("--repeats", type=int, default=5)
-    parser.add_argument("--routed", type=int, default=6,
-                        help="distinct experts routed per token (top-k union)")
+    parser.add_argument(
+        "--routed", type=int, default=6, help="distinct experts routed per token (top-k union)"
+    )
     parser.add_argument("--output", default="benchmarks/expert-fetch-bench.json")
     args = parser.parse_args()
 
@@ -105,9 +138,13 @@ def main() -> int:
 
     def make_sched(mode: str, workers: int) -> _ES:
         return _ES(
-            ExpertIndex.load(index_path), tmp, torch.device("cpu"), torch.float16,
+            ExpertIndex.load(index_path),
+            tmp,
+            torch.device("cpu"),
+            torch.float16,
             budget_bytes=int(args.bytes_per_expert_mb * 1024 * 1024) * args.experts,
-            mode=mode, workers=workers,
+            mode=mode,
+            workers=workers,
         )
 
     import torch
@@ -129,8 +166,11 @@ def main() -> int:
             t0 = time.perf_counter()
             module(torch.randn(4, 1024, dtype=torch.float16), _idx(eids), _w(_idx(eids).shape[1]))
             timings.append(time.perf_counter() - t0)
-        results[label] = {"median_s": statistics.median(timings),
-                          "min_s": min(timings), "all": timings}
+        results[label] = {
+            "median_s": statistics.median(timings),
+            "min_s": min(timings),
+            "all": timings,
+        }
         sched.cleanup()
 
     # Warm repeats (page cache hot): same experts, no eviction.
@@ -143,13 +183,14 @@ def main() -> int:
         t0 = time.perf_counter()
         module(torch.randn(4, 1024, dtype=torch.float16), _idx(eids), _w(_idx(eids).shape[1]))
         warm.append(time.perf_counter() - t0)
-    results["serial_warm"] = {"median_s": statistics.median(warm),
-                              "min_s": min(warm), "all": warm}
+    results["serial_warm"] = {"median_s": statistics.median(warm), "min_s": min(warm), "all": warm}
     sched.cleanup()
 
-    report = {"provenance": provenance(),
-              "config": vars(args) | {"tmp_bank": str(tmp)},
-              "results": results}
+    report = {
+        "provenance": provenance(),
+        "config": vars(args) | {"tmp_bank": str(tmp)},
+        "results": results,
+    }
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2))
@@ -175,8 +216,14 @@ def _attach(sched, layer: int, num_experts: int, workers: int):
 
     li = sched.index.layers[layer]
     module = SwlpCachedExperts(
-        layer, li.num_experts, li.hidden, li.intermediate,
-        torch.float16, torch.device("cpu"), "silu", sched,
+        layer,
+        li.num_experts,
+        li.hidden,
+        li.intermediate,
+        torch.float16,
+        torch.device("cpu"),
+        "silu",
+        sched,
         slots=li.num_experts,
     )
     sched.register(layer, module)

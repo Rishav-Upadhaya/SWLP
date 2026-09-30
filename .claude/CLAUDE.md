@@ -5,7 +5,7 @@ writing any code. These instructions override default behaviour — follow them
 exactly.
 
 The phase-by-phase project history (goals, task lists, measured numbers for
-Phases 0–18) lives in **`docs/ROADMAP.md`**, not here.
+Phases 0–32) lives in **`docs/ROADMAP.md`**, not here.
 
 ---
 
@@ -39,43 +39,24 @@ speed at equal quality.
 
 ## Current Status
 
-Phases 0–27 are implemented; the test suite is **489 tests, all passing**.
-The architecture has settled (streaming runners + the MLX interactive backend).
-Phase 20 (2026-06-11) eliminated the per-token copy overhead in the streaming
-hot path (`core/shard_io.py` + rewritten `core/streaming.py`): Mistral-7B
-direct-I/O streaming went 0.218 → 0.372 tok/s (75% of the cold-SSD ceiling),
-byte-identical output. `SWLP_DIRECT_IO=auto` now gives fitting models
-page-cache residency for free. Phase 21 (2026-06-11) added draft-model
-speculative decoding (`runner/draft.py`, `--draft-model`): a resident
-Qwen2.5-0.5B drafts for the streamed Qwen2.5-14B with adaptive (AIMD) draft
-length — measured 0.19 → **0.55–1.16 tok/s** (2.9×–5.9×, acceptance-bound),
-byte-identical output. Phase 22 (2026-06-11) added the lossless `.swz` shard
-codec (`codec.py`, `swlp compress-shards` / `--revert`): bit-exact ~31% disk
-shrink, CRC-gated against zipnn segfaults — a **negative result for tok/s on
-fast SSDs** (decompression contends for unified-memory bandwidth; crossover
-≈ 3.5 GB/s SSD read, M5 loses ~25%), so plain shards stay the default on the
-dev machine.
+Phases 0–27 and 29–33 are implemented (one known-flaky codec test:
+`test_codec.py::test_roundtrip_odd_length`, zipnn nondeterminism — the codec's
+own roundtrip gate refuses the bad write). The architecture has settled:
+streaming runners (`swlp`, `speculative`) + the MLX backends (`mlx`, `mlx-moe`).
+Measured numbers live in `docs/results.md`; the per-phase story in `docs/ROADMAP.md`.
 
-Phases 24–27 (2026-08-22) landed the research-driven upgrade: the **MoE
-expert-streaming engine** (shard format v2 expert banks + decomposed MoE
-forward, bit-exact vs HF; `ExpertScheduler` with global LRU expert cache,
-predictive routing prefetch, elastic budgets),
-**prefix-KV caching** with turn anchors (lossless re-prefill skipping in
-chat/serve), **multi-volume SSD striping**, **chunked prefill**,
-multi-resolution n-gram drafting, measured-SSD-bandwidth probing, `swlp pull`,
-`/v1/models`, doctor MoE advisory, and the `moe_sweep.py` harness. Two latent
-GPT-2 bugs were found by the new HF-reference logits tests and fixed: `ln_f`
-was never persisted/loaded (ran on uninitialized memory), and the adapter
-still used the legacy tuple-KV protocol (removed in transformers ≥5) (per-token KV was
-silently dropped). Design attribution: FreeToken (arXiv:2608.16157),
-Mixtral-offloading (arXiv:2312.17238), MoE-SpeQ, SpecMD, EAGLE-3.
+2026-09-30 pre-release cleanup (v0.1.0, PyPI-ready, not published): removed
+the FP8 shard tier, sparse shards, lossy EarlyExit/LayerPruner, the dead
+`pin_memory`/`double_buffer` knobs and `--adaptive-precision`; moved the
+scheduling simulators/analyzer (`sim`/`analyze`/`sweep`/`evaluate`/
+`policy-report`) out of the package to `scripts/research/simtools/`
+(`python -m scripts.research.simtools <cmd>`); docs consolidated to six pages.
+Releases: bump `swlp.__version__`, update CHANGELOG, tag `vX.Y.Z` →
+`.github/workflows/release.yml` (PyPI Trusted Publishing).
 
-Remaining work is **execution, not design** — see the "Open work" section of
-`docs/ROADMAP.md`: the paper-grade re-measurement (≥5 runs, median ± IQR,
-cold+warm, now including the draft-spec prompt spectrum), the Phase 28 MoE
-hardware measurements (Qwen3-30B-A3B first, DeepSeek-V4-Flash feasibility),
-and the deferred batched / 30B / long-context / perplexity measurements.
-(The MX230 NVIDIA column is dropped: the project is Apple-only.)
+Remaining work is **execution, not design** — see "Open work" in
+`docs/ROADMAP.md` (paper-grade re-measurement, Phase 28 MoE hardware runs,
+deferred batched / 30B / long-context / perplexity measurements).
 
 **When a phase completes:** update its checklist and Phase notes in
 `docs/ROADMAP.md`, then update this Current Status section. New phases are
@@ -103,9 +84,9 @@ appended to `docs/ROADMAP.md`.
    needs.
 
 **Must never do:**
-8. **Never violate the folder structure** — new runners go in `runner/`, new
-   reporters in `reporting/`, algorithm changes in `core/`. No files outside the
-   established layout.
+8. **Never violate the folder structure** — new runners go in `runner/`,
+   terminal output goes through `ui.py`, algorithm changes in `core/`. No files
+   outside the established layout.
 9. **Never hardcode** model paths, device strings, or magic numbers — use
    `AppConfig`, TOML configs, and `SWLP_*` env vars.
 10. **Never use `print()`** for runtime output — use `configure_logging()` from
@@ -117,7 +98,7 @@ appended to `docs/ROADMAP.md`.
 13. **Never delete phase history.** Phase notes and measured numbers in
     `docs/ROADMAP.md` are append-only.
 14. **Never mark a task `[x]`** in `docs/ROADMAP.md` without first running
-    `pytest` (all pass) and `ruff check src/` (zero errors).
+    `pytest` (all pass) and `ruff check src tests scripts` (zero errors).
 15. **Remove dead code** — if a file, class, or function is unused, delete it.
 16. **Wire it or delete it** — a config field that reaches `AppConfig` and no
     consumer is worse than no field. `tests/test_architecture.py` enforces
@@ -132,79 +113,36 @@ appended to `docs/ROADMAP.md`.
 
 ## Commands
 
-The CLI is flag-based: `swlp` with no subcommand runs inference. The backend is
-auto-selected (`--quant` → mlx, `--shard-dir` → swlp, else hf) or set explicitly
-with `--backend` (`mock` | `hf` | `swlp` | `speculative` | `mlx`). A `--config`
-TOML is optional.
+Eight commands; users name a model and `cli_resolve.py` picks the backend
+(MoE shards/MLX MoE → `mlx-moe`; dense shards → `swlp`, or `speculative` when an
+MTP head exists; `-q` → resident `mlx`; else `swlp pull` first). `--backend`
+(`mlx` | `mlx-moe` | `swlp` | `speculative` | `hf` | `mock`) overrides it.
+Presentation is `ui.py` (rich); tuning is `SWLP_*` env vars or `--config` TOML.
 
 ```bash
-# Inference
-swlp --backend mock --prompt "Hey"                               # offline, no model
-swlp --model mistral-7b --prompt "Explain transformers."         # HF inference
-swlp --model mistral-7b --backend mlx --quant int8 --prompt "Hi" # native MLX (Apple Silicon)
-swlp --shard-dir ./shards/mistral-7b --window 2 --prompt "Hi"    # SWLP layer streaming
-swlp --config configs/swlp_speculative_mps.toml --prompt "Hi"    # speculative decoding
-swlp                                                             # no args → prints help
-
-# Interactive chat (history kept across turns; streams tokens)
-swlp chat --model mistral-7b --backend mlx --quant int8
-swlp chat --shard-dir ./shards/mistral-7b --window 2
-
-# Download + shard a model to disk (one-time; required for the swlp backend)
-swlp download --model mistral-7b                                 # → ./shards/<name>
-
-# Benchmark / report / suite
-swlp benchmark --prompt-set short --runs 5 --warmup-runs 1 --report --config configs/baseline.toml
-swlp report benchmarks/baseline-<timestamp>.json
-swlp suite --suite configs/bench_suite.toml --report
-swlp suite-report benchmarks/suite-<timestamp>.json
-
-# Simulation (pure math, no model needed)
-swlp simulate --scenario configs/sim_baseline.toml --report
-
-# Model packaging / inspection
-swlp package /path/to/checkpoint /path/to/output --model-name demo-model
-swlp validate-package /path/to/output
-swlp layer /path/to/output model.layers.0
-
-# Hardware check + per-model recommendation (run first on every new machine)
-swlp doctor                     # chip / RAM / MLX + best command per model
-swlp models                     # list aliases with sizes and HF ids
-python scripts/phase0_hardware_check.py   # measured SSD bandwidth baseline
+swlp chat MODEL [-q int4|int8|bf16] [-n N]   # interactive (/help /clear /think /stats /exit)
+swlp chat MODEL -d                            # plan: backend + alternatives + settings (no load)
+swlp run MODEL "prompt" [--json]              # one answer; "-" reads stdin
+swlp serve MODEL [--host H --port P]          # OpenAI-compatible HTTP API
+swlp pull MODEL [--output-dir DIR]            # download + shard (MLX repos: download only)
+swlp models                                   # installed models + aliases
+swlp rm MODEL [-y]                            # delete shards / HF downloads / MLX copies
+swlp doctor [MODEL]                           # machine + what it can run + tuning
+swlp bench MODEL [--runs N] [--json]          # tok/s, first token, peak RAM (medians)
+swlp run anything "hi" --backend mock         # offline smoke test, no model
 
 # Test and lint — both must be clean before any task is marked done
 pytest                          # all tests
-pytest tests/test_simulator.py  # single file
-pytest -k test_config           # single test by name
+pytest tests/test_cli.py        # single file
 ruff check src/                 # lint
-ruff check --fix src/           # lint + autofix
 ```
 
-Model aliases: `mistral-7b`, `qwen-14b`, `tiny-gpt2`, `qwen3-30b-a3b`,
-`mixtral-8x7b`, `deepseek-v4-flash` — any HuggingFace id also works. Default output is a friendly summary; `--json` prints full metrics.
+Model aliases: `swlp models` (e.g. `gemma4-26b`, `qwen3.6-35b`, `olmoe-7b`,
+`mistral-7b`, `qwen-14b`); any HuggingFace id or local directory also works.
 
-**Environment variables** (override config without editing TOML):
-
-```
-SWLP_MODEL_ID        model to load                SWLP_DEVICE        mps | cpu
-SWLP_BACKEND         hf | swlp | mock | ...        SWLP_WINDOW_SIZE   sliding window depth
-SWLP_PREFETCH_DEPTH  layers ahead to prefetch      SWLP_SHARD_DIR     path to pre-sharded layers
-SWLP_KV_BUDGET_MB    KV cache RAM budget           SWLP_KV_COMPRESSION enable zlib KV compression
-SWLP_KV_TIERING      host offload for KV           SWLP_KV_DISK_DIR   disk-spill dir for cold KV
-SWLP_KV_QUANT        none (default) | int4 (lossy) SWLP_KV_WINDOW     keep last N KV positions (0=∞)
-SWLP_RESIDENCY       auto | off | <integer>        SWLP_MLX_QUANT     bf16 | int8 | int4
-SWLP_DIRECT_IO       auto | on | off (bypass page cache only when model > ~60% of free RAM)
-SWLP_SPEC_NGRAM      n-gram match size             SWLP_SPEC_MAX_DRAFT max draft tokens per sweep
-SWLP_SHARD_VOLUMES   extra shard dirs (striping)   SWLP_PREFILL_CHUNK tokens per prefill slice
-SWLP_EXPERT_CACHE_MB MoE expert-cache budget       SWLP_EXPERT_PREFETCH off|lru|predictive
-SWLP_DRAFT_MODEL     resident draft model for speculative decoding (must share target tokenizer)
-SWLP_STRICT          1 = re-raise hot-path failures instead of degrading (clean benchmarks)
-SWLP_MLX_WIRED_LIMIT auto | off | <MB>          SWLP_MLX_KV_BITS     0 | 4 | 8
-SWLP_MLX_KV_GROUP_SIZE  KV quant group (64)     SWLP_MLX_QUANTIZED_KV_START exact-prefix tokens
-SWLP_MLX_NUM_DRAFT_TOKENS  drafts/step (4)      SWLP_MLX_PREFILL_STEP  prefill chunk (2048)
-SWLP_MLX_PROMPT_CACHE  reuse prefix KV in chat
-SWLP_LOG_LEVEL       DEBUG | INFO | WARNING        SWLP_PROFILE       1 to collect detailed timings
-```
+**Environment variables:** every `RuntimeConfig` field `x` is overridable as
+`SWLP_X` (see `config.py`); the user-facing reference is `docs/configuration.md`.
+`SWLP_STRICT=1` re-raises hot-path failures instead of degrading (clean benchmarks).
 
 ---
 
@@ -241,12 +179,14 @@ swlp/                            ← project root
 ├── src/swlp/                    ← installable package
 │   ├── __init__.py              public API: HardwareInfo, ShardManifest, build_runner, RunMetrics, RunResult
 │   ├── __main__.py              enables `python -m swlp`
-│   ├── cli.py                   CLI dispatch + run path
-│   ├── cli_args.py              argparse parser construction (keeps cli.py under budget)
-│   ├── cli_help.py              CLI help text
-│   ├── cli_doctor.py            `swlp doctor` / `swlp models` — hardware probe + MoE advisory + aliases
-│   ├── chat.py                  interactive chat REPL (run_chat); history across turns
-│   ├── tui.py                   terminal presentation: colour, boxes, spinner, stream wrap
+│   ├── cli.py                   CLI dispatch — 8 commands (chat run serve pull models rm doctor bench)
+│   ├── cli_args.py              argparse parser + model aliases
+│   ├── cli_resolve.py           model → backend choice (Target)
+│   ├── cli_help.py              the `swlp` / `swlp -h` screen
+│   ├── cli_doctor.py            `swlp doctor` — machine, what it can run, tuning
+│   ├── cli_models.py            `swlp models` / `swlp rm` — installed models, aliases, on-disk artifacts
+│   ├── chat.py                  chat REPL + streamed answers (shared with `swlp run`)
+│   ├── ui.py                    rich presentation: panels, tables, streamed markdown, status line
 │   ├── serve.py                 `swlp serve` — stdlib OpenAI-compatible HTTP server (+SSE)
 │   ├── codec.py                 lossless `.swz` shard codec (zipnn byte-grouping); recommend_compression()
 │   ├── config.py                AppConfig + load_config(); env-var overlay — imported everywhere
@@ -261,17 +201,13 @@ swlp/                            ← project root
 │   │   ├── resident_policy.py   (pipeline_ratio, free_RAM) → target resident count, bilinear anchors
 │   │   ├── pipeline_model.py    pipeline-ratio estimation from hardware / from measured metrics
 │   │   ├── prefix_cache.py      PrefixKVCache — exact-match prefix KV reuse across chat turns
-│   │   ├── phase23.py           ActivationCache, PreallocBuffer (on) + EarlyExit, LayerPruner (opt-in lossy)
+│   │   ├── decode_cache.py      ActivationCache + PreallocBuffer — byte-identical decode speedups
 │   │   ├── speculative.py       NgramDrafter (prompt-lookup, multi-resolution) + verify_greedy()
-│   │   ├── moe_policy.py        q_star_split() (FreeToken) + RoutingHistory — pure MoE policy math
+│   │   ├── moe_policy.py        RoutingHistory — expert-routing history for predictive prefetch
 │   │   ├── kv_cache.py          KVCacheManager — device/host/compressed/disk tiers
 │   │   ├── compressed_cache.py  CompressedDynamicCache/Layer — transformers Cache over KVCacheManager
 │   │   ├── kv_quant.py          INT4 KV quantize/dequantize (opt-in lossy tier)
 │   │   ├── profiler.py          LayerProfiler — per-stage absolute timestamps; PipelineMetrics
-│   │   ├── simulator.py         discrete-event pipeline simulator with resource contention
-│   │   ├── sweep.py             run_sweep() — parameter sweeps over the simulator
-│   │   ├── evaluator.py         evaluate_policies() — side-by-side scheduling-policy comparison
-│   │   ├── analyzer.py          analyze_traces() — observation→diagnosis→recommendation report
 │   │   └── confidence.py        estimate_policy_confidence() — decision confidence + reasoning
 │   │
 │   ├── hardware/                Hardware detection — read-only, no side effects
@@ -281,8 +217,7 @@ swlp/                            ← project root
 │   │   ├── package.py           SWLP package format: package_checkpoint(), validate_package(), load_layer()
 │   │   ├── shard.py             shard_model_by_layer(); compress/decompress_shards(); verify_shards()
 │   │   ├── expert_bank.py       shard-format-v2 MoE expert banks — ranged reads of single experts
-│   │   ├── quant.py             FP8 weight quantize/dequantize of layer shards (Phase 7, negative)
-│   │   └── sparse.py            COO sparse weight encode/decode
+│   │   └── mlx_expert_index.py  expert byte ranges inside MLX-format (quantized) checkpoints
 │   │
 │   ├── runner/                  Inference runners — all interchangeable via build_runner()
 │   │   ├── base.py              build_runner() factory + execute_baseline() + check_hf_oom()
@@ -291,35 +226,34 @@ swlp/                            ← project root
 │   │   ├── swlp.py              SWLPRunner — sliding-window streaming inference (hot path)
 │   │   ├── swlp_setup.py        SWLPSetupMixin — residency/direct-IO resolution + RunMetrics
 │   │   ├── speculative.py       SpeculativeRunner(SWLPRunner) — verify K drafts in one disk sweep
-│   │   ├── draft.py             DraftModelDrafter — resident small model proposer (Phase 21)
+│   │   ├── draft.py             DraftModelDrafter — resident small model proposer
 │   │   ├── mlx.py               MlxRunner — native MLX quantized compute (Apple Silicon)
 │   │   ├── mlx_tune.py          wired-memory ceiling, KV-quant + spec-decode kwargs
+│   │   ├── mlx_moe.py           MlxMoeRunner — MoE expert streaming on MLX (resident dense, cached experts)
+│   │   ├── mlx_expert_cache.py  MlxExpertCache — per-expert MLX arrays, heap LFU, parallel pread
+│   │   ├── mlx_switch.py        CachedSwitchGLU — mlx_lm SwitchGLU drop-in over MlxExpertCache
+│   │   ├── mtp.py               MTP-head drafter — the checkpoint's own multi-token-prediction head
+│   │   ├── hybrid_rollback.py   state rollback for hybrid (linear-attention) models under speculation
 │   │   ├── batch.py             run_batch() — batched ("column-wise") streaming
 │   │   ├── experts.py           SwlpCachedExperts — slot-cached fused-Experts replacement (MoE)
 │   │   ├── expert_scheduler.py  ExpertScheduler — global LRU expert cache + predictive prefetch
 │   │   ├── arch.py              ArchAdapter — GPT2 vs Llama/Mistral dispatch
 │   │   └── load.py              load_full_model() + load_from_shards()
 │   │
-│   ├── benchmark/               Benchmarking & simulation — no side effects on runners
-│   │   ├── run.py               run_benchmark() — N timed runs, mean/median/std
-│   │   ├── suite.py             run_suite() — sweep across prompt sets and window configs
-│   │   ├── simulator.py         simulate_scenario() — pure-Python bottleneck math, no model
-│   │   └── event_simulator.py   EventSimulator + scheduling strategies — full layer-lifecycle model
-│   │
-│   └── reporting/               Output formatting — read-only; terminal/JSON/CSV
-│       ├── run_report.py        print_report() — benchmark result table
-│       ├── sim_report.py        print_simulation_report()
-│       ├── suite_report.py      print_suite_report() — baseline vs SWLP table
-│       └── policy_report.py     print_policy_report() — scheduling-policy comparison table
+│   └── benchmark/               Benchmarking & simulation — no side effects on runners
+│       ├── run.py               run_benchmark() — `swlp bench`; N timed runs, mean/median/std
+│       ├── suite.py             run_suite() — prompt-set × window sweeps (tests, scripts/research)
+│       └── simulator.py         simulate_scenario() — pure-Python bottleneck math, no model
 │
 ├── tests/                       pytest suite — mirrors src/swlp/ layout (see Testing)
 ├── configs/                     TOML config profiles — never hardcode values in source
 ├── scripts/                     user-facing utilities: bootstrap.sh, phase0_hardware_check.py,
 │   │                            generate_figures.py — not part of the package
 │   └── research/                phase one-offs & paper benchmarks (bench_common.py, phase3_baselines.py,
-│                                compare_airllm_swlp.py, moe_sweep.py, …) — root-finding uses parents[2]
-├── docs/                        documentation, incl. ROADMAP.md (phase history) and results.md
-├── experiments/ research/       raw experiment data and the paper source
+│       │                        compare_airllm_swlp.py, moe_sweep.py, …) — root-finding uses parents[2]
+│       └── simtools/            scheduling simulators + trace analyzer (moved out of the package)
+├── docs/                        configuration, architecture, formats, benchmarking, results, ROADMAP
+├── experiments/ research/       local-only (gitignored): raw experiment data, paper source, notes
 └── pyproject.toml               package metadata, deps, ruff (line-length=100, py311), pytest config
 ```
 
@@ -328,13 +262,12 @@ swlp/                            ← project root
 | Module | May import from | Must NOT import from |
 |---|---|---|
 | `config`, `metrics`, `logging` | stdlib only | anything in `src/swlp/` |
-| `core/` | `config`, `metrics`, `logging` | `runner/`, `benchmark/`, `reporting/` |
-| `hardware/` | `config`, `metrics`, `logging` | `core/`, `runner/`, `benchmark/`, `reporting/` |
-| `model/` | `config`, `metrics`, `logging` | `core/`, `runner/`, `benchmark/`, `reporting/` |
-| `runner/` | `config`, `metrics`, `logging`, `core/`, `hardware/`, `model/` | `benchmark/`, `reporting/` |
-| `benchmark/` | `config`, `metrics`, `logging`, `runner/` | `reporting/` |
-| `reporting/` | `config`, `metrics`, `logging`, `benchmark/` | `runner/` |
-| `cli.py`, `cli_args.py`, `chat.py` | any sub-package | — |
+| `core/` | `config`, `metrics`, `logging` | `runner/`, `benchmark/` |
+| `hardware/` | `config`, `metrics`, `logging` | `core/`, `runner/`, `benchmark/` |
+| `model/` | `config`, `metrics`, `logging` | `core/`, `runner/`, `benchmark/` |
+| `runner/` | `config`, `metrics`, `logging`, `core/`, `hardware/`, `model/` | `benchmark/` |
+| `benchmark/` | `config`, `metrics`, `logging`, `runner/` | — |
+| `cli*.py`, `chat.py`, `ui.py` | any sub-package | — |
 
 ---
 
@@ -362,7 +295,6 @@ hardcode values:
 | `swlp_qwen_mps.toml` / `swlp_qwen32b_mps.toml` | mps / swlp | M5 streaming Qwen2.5-14B / -32B |
 | `swlp_speculative_mps.toml` | mps / speculative | M5 prompt-lookup speculative decoding |
 | `swlp_mlx_mps.toml` | mps / mlx | M5 native MLX quantized backend |
-| `swlp_mistral_fp8_mps.toml` / `swlp_qwen_fp8_mps.toml` | mps / swlp | FP8 shard tier (Phase 7, negative result) |
 | `sim_baseline.toml` / `sim_m5.toml` / `sim_large.toml` | — | Simulator scenarios |
 | `bench_suite.toml` / `suite_phase3.toml` | — | Multi-prompt suite runs |
 
@@ -412,13 +344,13 @@ Use the lightest tier that genuinely verifies the change.
 `shard_model_by_layer(...)` and confirm `shard_manifest.json`; real-model change
 → run on M5 and record TTFT / tok/s. Never mock what can be tested for real.
 
-**Before marking any task done:** (1) `pytest` all pass, (2) `ruff check src/`
+**Before marking any task done:** (1) `pytest` all pass, (2) `ruff check src tests scripts`
 zero errors, (3) run the relevant CLI command and confirm output, (4) only then
 tick the checklist in `docs/ROADMAP.md`.
 
 Tests live in `tests/` and mirror the `src/swlp/` layout — each `test_*.py` maps
 to one module (e.g. `test_kv_cache.py` → `core/kv_cache.py`, `test_mlx.py` →
-`runner/mlx.py`). Current suite: **489 tests**. Run a single test with
+`runner/mlx.py`). Run a single test with
 `pytest tests/test_simulator.py::test_simulate_scenario_overlap`.
 
 ---

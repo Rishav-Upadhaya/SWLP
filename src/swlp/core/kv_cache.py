@@ -36,7 +36,7 @@ class _KVEntry:
     location: str  # "device" | "host" | "compressed" | "disk"
     disk_path: str | None = None
     disk_bytes: int = 0
-    # Phase 18: packed INT4 KV storage (packed_k, scales_k, packed_v, scales_v).
+    # Packed INT4 KV storage (packed_k, scales_k, packed_v, scales_v).
     # When set, ``tensors`` is None and quantized bytes are counted instead.
     quantized_tensors: tuple[torch.Tensor, ...] | None = None
 
@@ -75,12 +75,12 @@ class KVCacheManager:
         self.device = device
         self.device_budget_bytes = device_budget_bytes or self.budget_bytes
         self._profile = profile
-        # Phase 16: sliding-window KV budget.  When > 0, KV tensors are trimmed
+        # Sliding-window KV budget.  When > 0, KV tensors are trimmed
         # to the most recent kv_window token positions on every set() call.  This
         # bounds KV memory to kv_window × bytes_per_token × num_layers regardless
         # of context length.  0 = unbounded (current behaviour).
         self.kv_window = kv_window
-        # Phase 18: INT4 KV quantization mode — "none" | "int4".
+        # INT4 KV quantization mode — "none" | "int4".
         # "none" = lossless (default).  "int4" = lossy 4× compression; must be
         # explicitly opt-in.  Never silently activate — always label in reports.
         if kv_quant not in ("none", "int4"):
@@ -162,7 +162,7 @@ class KVCacheManager:
         storage (Phase 18 lossy tier).  The quantized entry stays on the host
         (CPU RAM) and is exempt from further zlib compression.
         """
-        # Phase 16: sliding-window trim — keep only the last kv_window positions.
+        # Sliding-window trim — keep only the last kv_window positions.
         if self.kv_window > 0 and tensors is not None:
             k, v = tensors
             seq_len = k.shape[-2]
@@ -182,7 +182,7 @@ class KVCacheManager:
                     pass
             self._update_usage_for_entry(prev, remove=True)
 
-        # Phase 18: INT4 quantization — store packed 4-tuple on host, exempt
+        # INT4 quantization — store packed 4-tuple on host, exempt
         # from zlib.  uncompressed_bytes is set to the actual quantized size so
         # budget enforcement accounts for the real footprint.
         if self.kv_quant == "int4" and tensors is not None:
@@ -236,7 +236,7 @@ class KVCacheManager:
             return None
         entry.last_access = time.time()
 
-        # Phase 18: dequantize INT4 on demand and return.
+        # Dequantize INT4 on demand and return.
         if entry.quantized_tensors is not None:
             pk, sk, pv, sv = entry.quantized_tensors
             desired = target_device or self.device
@@ -276,7 +276,7 @@ class KVCacheManager:
                 self._enforce_budget()
         return entry.tensors
 
-    # ── disk spill tier (Phase 12) ───────────────────────────────────────────
+    # ── disk spill tier ───────────────────────────────────────────
 
     def _spill_to_disk(self, layer_index: int, entry: _KVEntry) -> None:
         """Serialise KV entry to a temp file; free host / compressed memory."""

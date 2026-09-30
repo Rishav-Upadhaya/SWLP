@@ -11,9 +11,10 @@ import csv
 import json
 import tomllib
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from .run import timestamped_path
 
 BYTES_PER_MB = 1024 * 1024
 
@@ -30,7 +31,6 @@ class Scenario:
     kv_bytes_per_token: int
     device_memory_mb: float
     ram_capacity_mb: float
-    pcie_bandwidth_gbps: float
     ram_bandwidth_gbps: float
     disk_bandwidth_gbps: float
     disk_staging: bool
@@ -60,10 +60,7 @@ class SimulationResult:
 
 
 def default_simulation_path(format: str) -> Path:
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    directory = Path("simulations")
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"swlp-sim-{timestamp}.{format}"
+    return timestamped_path("simulations", "swlp-sim", format)
 
 
 def load_scenario(path: Path) -> Scenario:
@@ -80,7 +77,6 @@ def load_scenario(path: Path) -> Scenario:
         kv_bytes_per_token=int(data["kv_bytes_per_token"]),
         device_memory_mb=float(data["device_memory_mb"]),
         ram_capacity_mb=float(data["ram_capacity_mb"]),
-        pcie_bandwidth_gbps=float(data["pcie_bandwidth_gbps"]),
         ram_bandwidth_gbps=float(data["ram_bandwidth_gbps"]),
         disk_bandwidth_gbps=float(data.get("disk_bandwidth_gbps", 0.0)),
         disk_staging=bool(data.get("disk_staging", False)),
@@ -93,17 +89,15 @@ def _bandwidth_to_mb_per_s(gbps: float) -> float:
 
 
 def _transfer_seconds_per_layer(scenario: Scenario) -> float:
+    """Unified memory: a layer costs one RAM pass, plus an SSD read when staged from disk."""
     weight_mb = scenario.layer_weight_mb
-    pcie_mb_per_s = _bandwidth_to_mb_per_s(scenario.pcie_bandwidth_gbps)
-    pcie_seconds = weight_mb / pcie_mb_per_s if pcie_mb_per_s > 0 else float("inf")
-    if not scenario.disk_staging:
-        return pcie_seconds
-
     ram_mb_per_s = _bandwidth_to_mb_per_s(scenario.ram_bandwidth_gbps)
     ram_seconds = weight_mb / ram_mb_per_s if ram_mb_per_s > 0 else float("inf")
+    if not scenario.disk_staging:
+        return ram_seconds
     disk_mb_per_s = _bandwidth_to_mb_per_s(scenario.disk_bandwidth_gbps)
     disk_seconds = weight_mb / disk_mb_per_s if disk_mb_per_s > 0 else float("inf")
-    return disk_seconds + ram_seconds + pcie_seconds
+    return disk_seconds + ram_seconds
 
 
 def _compute_seconds_per_layer(scenario: Scenario) -> float:

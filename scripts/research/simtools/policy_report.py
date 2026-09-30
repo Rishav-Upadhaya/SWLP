@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..core.resident_policy import estimate_optimal_resident_count
+from swlp.core.resident_policy import estimate_optimal_resident_count
 
 _REQUIRED_FIELDS = {
     "machine",
@@ -97,8 +97,7 @@ def evaluate_policy_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             by_resident.setdefault(resident, []).append(tp)
 
         mean_tp_by_resident = {
-            resident: sum(values) / len(values)
-            for resident, values in by_resident.items()
+            resident: sum(values) / len(values) for resident, values in by_resident.items()
         }
 
         best_resident, best_tp = max(

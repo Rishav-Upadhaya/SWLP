@@ -7,8 +7,8 @@ other test:
    ``AppConfig`` and stopped there, so the entire Phase 12 disk-spill tier was
    unreachable in production while its unit tests passed.
 2. An import that crosses a layer boundary. The import table in AGENTS.md is
-   what keeps ``core/`` simulatable without a model and ``reporting/`` free of
-   runner imports; nothing checked it.
+   what keeps ``core/`` simulatable without a model and ``runner/`` free of
+   benchmark imports; nothing checked it.
 
 Both are structural, so both are checked structurally — by parsing the tree,
 not by running anything.
@@ -92,15 +92,13 @@ def test_every_config_field_is_overridable_from_env(
 
 # package -> packages it may NOT import from
 FORBIDDEN: dict[str, set[str]] = {
-    "config": {"core", "hardware", "model", "runner", "benchmark", "reporting"},
-    "metrics": {"core", "hardware", "model", "runner", "benchmark", "reporting"},
-    "logging": {"core", "hardware", "model", "runner", "benchmark", "reporting"},
-    "core": {"runner", "benchmark", "reporting"},
-    "hardware": {"core", "runner", "benchmark", "reporting"},
-    "model": {"core", "runner", "benchmark", "reporting"},
-    "runner": {"benchmark", "reporting"},
-    "benchmark": {"reporting"},
-    "reporting": {"runner"},
+    "config": {"core", "hardware", "model", "runner", "benchmark"},
+    "metrics": {"core", "hardware", "model", "runner", "benchmark"},
+    "logging": {"core", "hardware", "model", "runner", "benchmark"},
+    "core": {"runner", "benchmark"},
+    "hardware": {"core", "runner", "benchmark"},
+    "model": {"core", "runner", "benchmark"},
+    "runner": {"benchmark"},
 }
 
 

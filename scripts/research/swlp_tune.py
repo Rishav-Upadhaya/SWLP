@@ -4,6 +4,7 @@
 Runs a parameter sweep over window sizes, prefetch depths and memory settings,
 records timings and overlap metrics, and writes a recommended profile JSON.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -12,8 +13,9 @@ import time
 from pathlib import Path
 from statistics import mean
 
-from swlp.config import load_config
 from swlp.runtime import build_runner
+
+from swlp.config import load_config
 
 
 def analyze_trace(trace: list[dict]) -> dict:
@@ -31,7 +33,11 @@ def analyze_trace(trace: list[dict]) -> dict:
         if pe <= cs:
             overlaps += 1
     overlap_ratio = overlaps / successes if successes > 0 else 0.0
-    return {"overlap_ratio": overlap_ratio, "prefetch_success_count": overlaps, "prefetch_attempts": successes}
+    return {
+        "overlap_ratio": overlap_ratio,
+        "prefetch_success_count": overlaps,
+        "prefetch_attempts": successes,
+    }
 
 
 def run_once(cfg, prompt, profile):
@@ -68,8 +74,6 @@ def main() -> int:
     # parameter grid (conservative defaults)
     window_sizes = [1, 2, 3]
     prefetch_depths = [1, 2, 4]
-    pin_memory_opts = [False, True]
-    double_buffer_opts = [False, True]
 
     results = {
         "device": cfg.runtime.device,
@@ -78,30 +82,24 @@ def main() -> int:
 
     for w in window_sizes:
         for d in prefetch_depths:
-            for pin in pin_memory_opts:
-                for db in double_buffer_opts:
-                    cfg.runtime.swlp_window_size = w
-                    cfg.runtime.swlp_prefetch_depth = d
-                    cfg.runtime.swlp_pin_memory = pin
-                    cfg.runtime.swlp_double_buffer = db
-                    cfg.runtime.swlp_prefetch = True
-                    runs = []
-                    for _ in range(args.repeat):
-                        metrics, trace_analysis, trace = run_once(cfg, prompt, profile=args.profile)
-                        runs.append({"metrics": metrics, "trace_analysis": trace_analysis})
-                    avg_elapsed = mean(r["metrics"]["elapsed"] for r in runs)
-                    avg_overlap = mean(r["trace_analysis"].get("overlap_ratio", 0.0) for r in runs)
-                    grid_entry = {
-                        "window_size": w,
-                        "prefetch_depth": d,
-                        "pin_memory": pin,
-                        "double_buffer": db,
-                        "avg_elapsed": avg_elapsed,
-                        "avg_overlap": avg_overlap,
-                        "runs": runs,
-                    }
-                    results["grid"].append(grid_entry)
-                    print(f"Test w={w} d={d} pin={pin} db={db} -> elapsed={avg_elapsed:.3f}s overlap={avg_overlap:.3f}")
+            cfg.runtime.swlp_window_size = w
+            cfg.runtime.swlp_prefetch_depth = d
+            cfg.runtime.swlp_prefetch = True
+            runs = []
+            for _ in range(args.repeat):
+                metrics, trace_analysis, trace = run_once(cfg, prompt, profile=args.profile)
+                runs.append({"metrics": metrics, "trace_analysis": trace_analysis})
+            avg_elapsed = mean(r["metrics"]["elapsed"] for r in runs)
+            avg_overlap = mean(r["trace_analysis"].get("overlap_ratio", 0.0) for r in runs)
+            grid_entry = {
+                "window_size": w,
+                "prefetch_depth": d,
+                "avg_elapsed": avg_elapsed,
+                "avg_overlap": avg_overlap,
+                "runs": runs,
+            }
+            results["grid"].append(grid_entry)
+            print(f"Test w={w} d={d} -> elapsed={avg_elapsed:.3f}s overlap={avg_overlap:.3f}")
 
     # choose best by lowest elapsed, prefer higher overlap as tie-breaker
     best = min(results["grid"], key=lambda e: (e["avg_elapsed"], -e["avg_overlap"]))
@@ -113,8 +111,6 @@ def main() -> int:
             "swlp_window_size": int(best["window_size"]),
             "swlp_prefetch_depth": int(best["prefetch_depth"]),
             "swlp_prefetch": True,
-            "swlp_pin_memory": bool(best["pin_memory"]),
-            "swlp_double_buffer": bool(best["double_buffer"]),
         }
     }
 

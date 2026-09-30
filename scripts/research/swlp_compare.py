@@ -3,17 +3,18 @@
 
 Minimal utility for Phase 8 prototype validation.
 """
+
 from __future__ import annotations
 
-import json
-import os
-import time
-import difflib
 import argparse
+import difflib
+import json
+import time
 from pathlib import Path
 
-from swlp.config import load_config
 from swlp.runtime import build_runner
+
+from swlp.config import load_config
 
 
 def main() -> int:
@@ -59,7 +60,7 @@ def main() -> int:
     # collect trace if available on runner
     trace = None
     if hasattr(swlp_runner, "_trace"):
-        trace = getattr(swlp_runner, "_trace")
+        trace = swlp_runner._trace
         results["swlp_trace"] = trace
 
     out_path = Path(args.out)

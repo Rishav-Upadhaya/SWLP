@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use SWLP in your research, please cite it as below."
 title: "SWLP: Sliding Window Layer Pipeline"
 abstract: >-
-  Memory-efficient FP16 LLM inference on consumer hardware via
+  Memory-efficient FP16 LLM inference on Apple Silicon via
   layer streaming. Runs models larger than available RAM by
   streaming transformer layers SSD-to-RAM through a sliding
   window, with zero quantization of weights.
@@ -14,7 +14,7 @@ authors:
 repository-code: "https://github.com/Rishav-Upadhaya/SWLP"
 license: MIT
 version: 0.1.0
-date-released: "2026-06-10"
+date-released: "2026-09-30"
 keywords:
   - llm
   - inference

@@ -1,129 +1,260 @@
-"""Tests for swlp.cli — the flag-based CLI and tool subcommands."""
+"""The `swlp` CLI surface: seven commands, end-to-end on the mock backend."""
+from __future__ import annotations
+
+import io
+import json
+
+import pytest
+
 from swlp.cli import main
 from swlp.cli_args import build_parser, resolve_model
 
-
-def test_run_via_backend_flag(capsys):
-    exit_code = main(["--backend", "mock", "--prompt", "Hello swlp", "--json"])
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    assert "Hello swlp" in captured.out
-    assert "mock" in captured.out
-
-
-def test_run_via_env_backend(capsys, monkeypatch):
-    monkeypatch.setenv("SWLP_BACKEND", "mock")
-    exit_code = main(["--prompt", "Hello swlp"])
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    assert "Hello swlp" in captured.out
-
-
-def test_friendly_summary_is_printed(capsys, monkeypatch):
-    monkeypatch.setenv("SWLP_BACKEND", "mock")
-    main(["--prompt", "Hi", "--profile"])
-    captured = capsys.readouterr()
-    assert "Completion:" in captured.out
-    assert "backend=mock" in captured.out
-    assert "tok/s" in captured.out
+COMMANDS = ["chat", "run", "serve", "pull", "models", "rm", "doctor", "bench"]
 
 
 def test_bare_invocation_prints_help(capsys):
-    exit_code = main([])
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    # Custom help — not argparse's "usage: swlp" header.
-    assert "SWLP" in captured.out
-    assert "TWO WAYS TO RUN" in captured.out      # resident MLX vs FP16 streaming
-    assert "DOWNLOAD" in captured.out
+    assert main([]) == 0
+    out = capsys.readouterr().out
+    for cmd in COMMANDS:
+        assert f"swlp {cmd}" in out
 
 
-def test_help_command_prints_all_sections(capsys):
-    exit_code = main(["help"])
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    for section in ("QUICK START", "DOWNLOAD", "CHAT", "FLAGS", "BENCHMARKING"):
-        assert section in captured.out, f"Missing section: {section}"
-    # Key commands must appear.
-    assert "swlp download --model" in captured.out
-    assert "swlp chat" in captured.out
-    assert "--shard-dir" in captured.out
+def test_version(capsys):
+    assert main(["--version"]) == 0
+    assert capsys.readouterr().out.startswith("swlp ")
+
+
+@pytest.mark.parametrize("removed", ["simulate", "suite", "package", "layer", "download",
+                                     "compress-shards", "profile", "report", "help"])
+def test_removed_commands_are_gone(removed):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([removed])
+
+
+def test_every_command_parses():
+    p = build_parser()
+    assert p.parse_args(["chat", "m", "-q", "int4"]).quant == "int4"
+    assert p.parse_args(["run", "m", "hi", "-n", "7"]).max_tokens == 7
+    assert p.parse_args(["serve", "m", "--port", "9"]).port == 9
+    assert p.parse_args(["pull", "m"]).model == "m"
+    assert p.parse_args(["models"]).command == "models"
+    assert p.parse_args(["doctor"]).model is None
+    assert p.parse_args(["bench", "m", "--runs", "2"]).runs == 2
+
+
+def test_run_streams_answer(capsys):
+    assert main(["run", "anything", "hello there", "--backend", "mock"]) == 0
+    out = capsys.readouterr().out
+    assert "hello there" in out and "tok/s" in out
+
+
+def test_run_json(capsys):
+    assert main(["run", "anything", "hi json", "--backend", "mock", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["backend"] == "mock"
+    assert "hi json" in payload["completion"]
+    assert "throughput_tokens_per_second" in payload["metrics"]
+
+
+def test_run_reads_prompt_from_stdin(capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin", io.StringIO("from stdin"))
+    assert main(["run", "anything", "-", "--backend", "mock"]) == 0
+    assert "from stdin" in capsys.readouterr().out
+
+
+def test_run_without_prompt_explains(capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    assert main(["run", "anything", "--backend", "mock"]) == 1
+    assert "no prompt" in capsys.readouterr().err
+
+
+def test_unprepared_model_suggests_pull(capsys, monkeypatch):
+    monkeypatch.setattr("swlp.cli_resolve.hub_config", lambda _id: None)
+    assert main(["run", "some/unpulled-model", "hi"]) == 1
+    err = capsys.readouterr().err
+    assert "swlp pull some/unpulled-model" in err and "-q int4" in err
+
+
+def test_chat_exits_on_slash_exit(capsys, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda *_: "/exit")
+    assert main(["chat", "anything", "--backend", "mock"]) == 0
+    assert "bye" in capsys.readouterr().out
+
+
+def test_bench_json(capsys):
+    assert main(["bench", "anything", "--backend", "mock", "--runs", "1", "--json"]) == 0
+    summary = json.loads(capsys.readouterr().out)["summary"]
+    assert summary["runs"] >= 1
+
+
+def test_models_lists_aliases(capsys):
+    assert main(["models"]) == 0
+    assert "gemma4-26b" in capsys.readouterr().out
 
 
 def test_model_alias_resolution():
     assert resolve_model("mistral-7b") == "unsloth/mistral-7b-instruct-v0.2"
-    assert resolve_model("qwen-14b") == "Qwen/Qwen2.5-14B-Instruct"
-    # An unknown name (a real HF id) is passed through unchanged.
-    assert resolve_model("org/some-model") == "org/some-model"
+    assert resolve_model("some/org-model") == "some/org-model"
 
 
-def test_quant_flag_implies_mlx_backend():
-    parser = build_parser()
-    args = parser.parse_args(["--model", "mistral-7b", "--quant", "int8"])
-    assert args.quant == "int8"
-    assert args.backend is None  # backend is inferred later, not parsed
+def test_pull_refuses_when_disk_too_small(tmp_path, monkeypatch, capsys):
+    from swlp import cli
+
+    monkeypatch.setattr("swlp.cli_doctor.KNOWN_FP16_GB", {"big": 100.0})
+    monkeypatch.setattr("shutil.disk_usage", lambda _p: type("U", (), {"free": 10 * 1024**3})())
+    assert cli._enough_disk("big", tmp_path) is False
+    assert "not enough disk" in capsys.readouterr().err
+    assert cli._enough_disk("unknown-alias", tmp_path) is True
 
 
-def test_window_alias_accepted():
-    parser = build_parser()
-    args = parser.parse_args(["--swlp-window-size", "4"])
-    assert args.window == 4
-    args = parser.parse_args(["--window", "6"])
-    assert args.window == 6
+def test_max_tokens_spellings_and_until_done_default():
+    p = build_parser()
+    for flag in ("-n", "--max-tokens", "--max_tokens", "--max-new-tokens"):
+        assert p.parse_args(["chat", "m", flag, "18000"]).max_tokens == 18000
+    from swlp.cli import UNTIL_DONE, _prepare
+
+    config, _ = _prepare(p.parse_args(["chat", "m", "--backend", "mock"]))
+    assert config.generation.max_new_tokens == UNTIL_DONE  # no 32-token cut-off
 
 
-def test_benchmark_creates_metrics_file(tmp_path, monkeypatch):
-    monkeypatch.setenv("SWLP_BACKEND", "mock")
-    output_path = tmp_path / "benchmark.json"
-    exit_code = main(
-        ["benchmark", "--prompt", "Hello swlp", "--output", str(output_path), "--format", "json"]
-    )
-    assert exit_code == 0
-    payload = output_path.read_text(encoding="utf-8")
-    assert "runs" in payload
-    assert "time_to_first_token_seconds" in payload
+def test_ctrl_c_at_prompt_exits(capsys, monkeypatch):
+    def interrupt(*_):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", interrupt)
+    assert main(["chat", "anything", "--backend", "mock"]) == 0
+    assert "bye" in capsys.readouterr().out
 
 
-# ── swlp pull disk preflight (Phase 24) ──────────────────────────────────────
-
-def test_preflight_passes_for_unknown_model(tmp_path):
-    from swlp.cli import _preflight_disk_space
-    # Arbitrary HF ids have no known size — preflight stays silent.
-    assert _preflight_disk_space("some-org/some-model", tmp_path / "out") is True
-
-
-def test_preflight_blocks_when_disk_too_small(tmp_path, monkeypatch):
-    import shutil as _shutil
-
-    from swlp.cli import _preflight_disk_space
-
-    free = _shutil.disk_usage  # keep a handle for the real call
-
-    def _tiny(path):
-        usage = free(path)
-        return _shutil._ntuple_diskusage(usage.total, usage.used, 0)  # zero free
-
-    monkeypatch.setattr("shutil.disk_usage", _tiny)
-    # mistral-7b is a known 14 GB alias → must refuse with zero free bytes.
-    assert _preflight_disk_space("mistral-7b", tmp_path / "out") is False
+def _fake_model(tmp_path, monkeypatch):
+    """shards/<name> + an empty HF cache, in a scratch cwd."""
+    monkeypatch.chdir(tmp_path)
+    d = tmp_path / "shards" / "demo"
+    d.mkdir(parents=True)
+    (d / "shard_manifest.json").write_text("{}")
+    (d / "layer_000.safetensors").write_bytes(b"x" * 1024)
+    monkeypatch.setattr("huggingface_hub.scan_cache_dir",
+                        lambda *_: type("I", (), {"repos": []})())
+    return d
 
 
-def test_preflight_passes_when_disk_sufficient(tmp_path):
-    # tmp filesystems in CI generally have > 14 GB × 1.15 free; if the runner
-    # is genuinely that constrained the unknown-model branch above still holds.
-    import shutil
-
-    from swlp.cli import _preflight_disk_space
-    free_gb = shutil.disk_usage(tmp_path).free / 1024**3
-    expected = free_gb >= 14 * 1.15
-    assert _preflight_disk_space("mistral-7b", tmp_path / "out") is expected
+def test_rm_lists_then_deletes_with_yes(tmp_path, monkeypatch, capsys):
+    d = _fake_model(tmp_path, monkeypatch)
+    assert main(["rm", "demo", "--yes"]) == 0
+    assert not d.exists()
+    assert "freed" in capsys.readouterr().out
 
 
-def test_pull_subcommand_parses_like_download():
-    from swlp.cli_args import build_parser
+def test_rm_keeps_everything_when_declined(tmp_path, monkeypatch, capsys):
+    d = _fake_model(tmp_path, monkeypatch)
+    monkeypatch.setattr("builtins.input", lambda *_: "n")
+    assert main(["rm", "demo"]) == 0
+    assert d.exists()
 
-    parser = build_parser()
-    args = parser.parse_args(["pull", "--model", "mistral-7b"])
-    assert args.command == "pull"
-    assert args.model == "mistral-7b"
-    assert args.output_dir is None
+
+def test_rm_unknown_model_is_a_noop(tmp_path, monkeypatch, capsys):
+    _fake_model(tmp_path, monkeypatch)
+    assert main(["rm", "not-installed"]) == 0
+    assert "nothing on disk" in capsys.readouterr().out
+
+
+def test_details_explains_without_loading(capsys, tmp_path, monkeypatch):
+    """`-d` and bare `--backend` print the plan (backends + settings), load nothing."""
+    monkeypatch.chdir(tmp_path)
+    d = tmp_path / "shards" / "m"
+    d.mkdir(parents=True)
+    (d / "shard_manifest.json").write_text('{"model_id": "org/m", "weight_dtype": "bfloat16"}')
+    for argv in (["chat", "m", "-d"], ["chat", "m", "--backend"], ["run", "m", "--backend", "-d"]):
+        assert main(argv) == 0
+        out = capsys.readouterr().out
+        assert "Backends" in out and "SWLP_WINDOW_SIZE" in out and "SWLP_RESIDENCY" in out
+
+
+def test_unknown_backend_lists_the_options(capsys):
+    assert main(["chat", "m", "--backend", "turbo"]) == 2
+    assert "mlx-moe" in capsys.readouterr().err
+
+
+def test_models_details(capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    d = tmp_path / "shards" / "m"
+    d.mkdir(parents=True)
+    (d / "shard_manifest.json").write_text(json.dumps(
+        {"model_id": "org/m", "weight_dtype": "bfloat16", "num_layers": 4,
+         "layer_weight_mb": 10, "num_experts": 8, "top_k": 2}))
+    (d / "expert_index.json").write_text("{}")
+    monkeypatch.setattr("swlp.cli_models._HF_HUB", tmp_path / "no-hub")
+    assert main(["models", "-d"]) == 0
+    out = capsys.readouterr().out
+    assert "8 per layer · top-2" in out and "swlp rm m" in out
+
+
+def test_too_big_for_resident_mlx_is_refused_early(capsys, monkeypatch):
+    from swlp import cli
+    from swlp.cli_resolve import Target
+
+    monkeypatch.setattr("mlx.core.device_info",
+                        lambda: {"max_recommended_working_set_size": int(11.8 * 1024**3)})
+    big = Target("mlx", "org/27b", "MLX int4 · resident", quant="int4", full_gb=48.0)
+    args = build_parser().parse_args(["chat", "27b", "-q", "int4"])
+    assert cli._fits_resident(big, args) is False
+    assert "stream it instead" in capsys.readouterr().err
+    small = Target("mlx", "org/7b", "MLX int4 · resident", quant="int4", full_gb=14.0)
+    assert cli._fits_resident(small, args) is True
+
+
+def test_errors_are_one_line_not_a_traceback(capsys, monkeypatch):
+    def boom(_args):
+        raise RuntimeError("disk on fire\nsecond line")
+
+    monkeypatch.setattr("swlp.cli._run", boom)
+    assert main(["run", "m", "hi"]) == 1
+    err = capsys.readouterr().err
+    assert "RuntimeError: disk on fire" in err and "second line" not in err and "-v" in err
+
+
+def test_line_breaks_survive_markdown_but_code_is_untouched():
+    from swlp.ui import _hard_breaks
+
+    assert _hard_breaks("Red\nBlue") == "Red  \nBlue"
+    assert _hard_breaks("a\n```\nx\ny\n```\nb") == "a  \n```\nx\ny\n```  \nb"
+
+
+def _dense_shards(tmp_path, monkeypatch, layer_mb=761.0):
+    monkeypatch.chdir(tmp_path)
+    d = tmp_path / "shards" / "m"
+    d.mkdir(parents=True)
+    (d / "shard_manifest.json").write_text(json.dumps({
+        "model_id": "org/m", "num_layers": 64, "layer_weight_mb": layer_mb,
+        "total_weight_mb": 64 * layer_mb, "embed_file": "embed.pt",
+        "lm_head_file": "lm_head.pt", "model_type": "llama", "weight_dtype": "bfloat16"}))
+
+
+def test_resident_and_window_reach_the_config(tmp_path, monkeypatch):
+    from swlp.cli import _prepare
+
+    _dense_shards(tmp_path, monkeypatch, layer_mb=1.0)
+    config, target = _prepare(build_parser().parse_args(
+        ["chat", "m", "--resident", "4", "--window", "3"]))
+    assert target.backend == "swlp"
+    assert config.runtime.swlp_residency == "4" and config.runtime.swlp_window_size == 3
+
+
+def test_resident_that_cannot_fit_is_refused(tmp_path, monkeypatch, capsys):
+    from swlp.cli import _prepare
+
+    _dense_shards(tmp_path, monkeypatch)
+    monkeypatch.setattr("psutil.virtual_memory",
+                        lambda: type("V", (), {"available": 8 * 1024**3})())
+    args = build_parser().parse_args(["chat", "m", "--resident", "30"])
+    assert _prepare(args) is None
+    err = capsys.readouterr().err
+    assert "only 8 fit" in err and "--resident 8" in err
+
+
+def test_bad_resident_value(tmp_path, monkeypatch, capsys):
+    from swlp.cli import _prepare
+
+    _dense_shards(tmp_path, monkeypatch)
+    assert _prepare(build_parser().parse_args(["chat", "m", "--resident", "lots"])) is None
+    assert "layer count, auto, or off" in capsys.readouterr().err

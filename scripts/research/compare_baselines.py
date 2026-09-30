@@ -13,14 +13,10 @@ Baselines and where each can run:
   | swlp        | sliding-window SSD→RAM streaming (ours)      | ✅ (shards)  |
   | airllm      | layer-by-layer MLX streaming, no prefetch    | ✅           |
   | accelerate  | HF `device_map` disk offload (the one-liner) | ✅ (cpu+disk)|
-  | ollm        | SSD layer+KV streaming, FlashAttention-2     | ❌ CUDA only |
-  | zero        | DeepSpeed ZeRO-Inference NVMe offload        | ❌ CUDA only |
 
 `accelerate` is the most important *new* baseline: it is the trivial,
 already-installed, lossless prior-art alternative to SWLP, and it runs here.
-`ollm` and `zero` need a CUDA GPU (oLLM also needs flash-attn, which does not
-build on macOS) — their adapters self-report as unavailable on this machine and
-are ready for the Pop!_OS/MX230 box.
+oLLM and DeepSpeed ZeRO-Inference are CUDA-only and out of scope (Apple-only project).
 
 SWLP and AirLLM logic is **imported** from ``compare_airllm_swlp`` (no
 duplication); page-cache control and provenance come from ``bench_common``.
@@ -30,6 +26,7 @@ Usage:
   python scripts/research/compare_baselines.py --backends swlp,accelerate,airllm --cold   # needs sudo
   python scripts/research/compare_baselines.py --list                                     # show availability
 """
+
 from __future__ import annotations
 
 import argparse
@@ -76,6 +73,7 @@ ACCEL_DEFAULTS = {
 # New baseline: HuggingFace Accelerate disk offload (the lossless one-liner)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _accelerate_available(cfg: dict) -> tuple[bool, str]:
     try:
         import accelerate  # noqa: F401
@@ -110,8 +108,10 @@ def _build_accelerate_runner(cfg: dict) -> Any:
     # Only the real device (cpu) gets a budget; with offload_folder set,
     # device_map="auto" spills the overflow to disk automatically.
     max_memory = {"cpu": merged["accel_cpu_gb"]}
-    print(f"    [accelerate] loading {model_id} with disk offload "
-          f"(cpu budget {merged['accel_cpu_gb']}, offload → {offload_dir})…")
+    print(
+        f"    [accelerate] loading {model_id} with disk offload "
+        f"(cpu budget {merged['accel_cpu_gb']}, offload → {offload_dir})…"
+    )
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         dtype=torch.float16,
@@ -159,7 +159,7 @@ def _run_accelerate(handle: Any, prompt: str, n_runs: int = 2, cold: bool = Fals
         tps_list.append(new_tokens / gen_s if gen_s > 0 else 0.0)
         gen_s_list.append(gen_s)
         ram_list.append(max(rss_before, rss_after))
-        completion = tok.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        completion = tok.decode(out[0, inputs["input_ids"].shape[1] :], skip_special_tokens=True)
         _gc()
 
     return {
@@ -173,69 +173,6 @@ def _run_accelerate(handle: Any, prompt: str, n_runs: int = 2, cold: bool = Fals
         "compute_device": handle.get("compute_device", "cpu"),
         "runs": n_runs,
     }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CUDA-only baselines: oLLM and DeepSpeed ZeRO-Inference (scaffolds)
-# ─────────────────────────────────────────────────────────────────────────────
-# These adapters are NOT validated on this M5 (no CUDA; oLLM needs flash-attn,
-# which does not build on macOS). available() gates them off here; the build/run
-# bodies are documented starting points to fill in on the CUDA machine.
-
-def _cuda_present() -> bool:
-    try:
-        import torch
-        return bool(torch.cuda.is_available())
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _ollm_available(cfg: dict) -> tuple[bool, str]:
-    try:
-        import ollm  # noqa: F401
-    except Exception:  # noqa: BLE001
-        return False, "oLLM not installed (needs flash-attn; no macOS build) — run on CUDA box"
-    if not _cuda_present():
-        return False, "oLLM requires a CUDA GPU"
-    return True, "ok"
-
-
-def _build_ollm_runner(cfg: dict) -> Any:  # pragma: no cover - CUDA only
-    # Scaffold — verify against the installed oLLM API on the CUDA machine:
-    #   from ollm import Inference
-    #   o = Inference(cfg["model_id"], device="cuda:0")
-    #   o.ini_model(models_dir=cfg.get("ollm_models_dir"), force_download=False)
-    #   o.offload_layers_to_cpu()  # or to_ssd, per oLLM version
-    #   return {"o": o, "tok": o.tokenizer}
-    raise NotImplementedError("oLLM adapter is a CUDA-only scaffold; implement on the MX230 box.")
-
-
-def _cuda_only_run(handle: Any, prompt: str, n_runs: int, cold: bool) -> dict:  # pragma: no cover
-    """Placeholder run for CUDA-only baselines; never reached on this machine
-    (their ``available()`` returns False and ``build()`` raises first)."""
-    raise NotImplementedError("CUDA-only baseline; implement build()/run() on the MX230 box.")
-
-
-def _zero_available(cfg: dict) -> tuple[bool, str]:
-    try:
-        import deepspeed  # noqa: F401
-    except Exception:  # noqa: BLE001
-        return False, "deepspeed not installed — run on CUDA box"
-    if not _cuda_present():
-        return False, "ZeRO-Inference requires a CUDA GPU"
-    return True, "ok"
-
-
-def _build_zero_runner(cfg: dict) -> Any:  # pragma: no cover - CUDA only
-    # Scaffold — DeepSpeed ZeRO-Inference with NVMe weight offload:
-    #   ds_config = {"zero_optimization": {"stage": 3,
-    #       "offload_param": {"device": "nvme", "nvme_path": cfg["nvme_path"]}}}
-    #   from transformers.integrations import HfDeepSpeedConfig
-    #   _dschf = HfDeepSpeedConfig(ds_config)  # keep alive before from_pretrained
-    #   model = AutoModelForCausalLM.from_pretrained(cfg["model_id"], dtype=torch.float16)
-    #   ds_engine = deepspeed.initialize(model=model, config_params=ds_config)[0]
-    #   return {"engine": ds_engine.module, "tok": AutoTokenizer.from_pretrained(cfg["model_id"])}
-    raise NotImplementedError("ZeRO-Inference adapter is a CUDA-only scaffold; implement on MX230.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -256,6 +193,7 @@ def _swlp_available(cfg: dict) -> tuple[bool, str]:
 
 def _airllm_available(cfg: dict) -> tuple[bool, str]:
     import platform
+
     if platform.system() != "Darwin":
         return False, "AirLLM MLX path is Apple-Silicon only here"
     try:
@@ -271,7 +209,7 @@ BASELINES: dict[str, dict[str, Any]] = {
     "swlp": {
         "label": "SWLP (W=2 FP16 streaming)",
         "available": _swlp_available,
-        "build": lambda cfg: _build_swlp_runner(cfg),                 # (runner, app_cfg)
+        "build": lambda cfg: _build_swlp_runner(cfg),  # (runner, app_cfg)
         "run": lambda h, p, n, cold: _run_swlp(h[0], h[1], p, n_runs=n, cold=cold),
     },
     "airllm": {
@@ -286,24 +224,13 @@ BASELINES: dict[str, dict[str, Any]] = {
         "build": _build_accelerate_runner,
         "run": _run_accelerate,
     },
-    "ollm": {
-        "label": "oLLM (SSD streaming, CUDA)",
-        "available": _ollm_available,
-        "build": _build_ollm_runner,
-        "run": _cuda_only_run,
-    },
-    "zero": {
-        "label": "DeepSpeed ZeRO-Inference (NVMe, CUDA)",
-        "available": _zero_available,
-        "build": _build_zero_runner,
-        "run": _cuda_only_run,
-    },
 }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Run loop + reporting
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _warmup(backend: str, handle: Any, prompt: str) -> None:
     """One discarded run to warm model/page caches, matching the other harness."""
@@ -312,11 +239,13 @@ def _warmup(backend: str, handle: Any, prompt: str) -> None:
             handle[0].run(prompt, profile=False)
         elif backend == "airllm":
             import mlx.core as mx
+
             x = mx.array([handle.tokenizer.encode(prompt)])
             for _tok in handle.model_generate(x, temperature=0):
                 break
         elif backend == "accelerate":
             import torch
+
             inp = handle["tok"](prompt, return_tensors="pt")
             with torch.no_grad():
                 handle["model"].generate(**inp, max_new_tokens=1, do_sample=False)
@@ -340,15 +269,18 @@ def _list_availability(model_keys: list[str]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Honest multi-baseline streaming benchmark")
-    parser.add_argument("--backends", default="swlp,accelerate",
-                        help="comma list from: swlp,airllm,accelerate,ollm,zero")
+    parser.add_argument(
+        "--backends", default="swlp,accelerate", help="comma list from: swlp,airllm,accelerate"
+    )
     parser.add_argument("--models", default="7b", help="comma list of model keys (default: 7b)")
     parser.add_argument("--runs", type=int, default=2, help="timed runs per prompt (default: 2)")
-    parser.add_argument("--cold", action="store_true",
-                        help="drop OS page cache before each timed run (needs sudo)")
+    parser.add_argument(
+        "--cold", action="store_true", help="drop OS page cache before each timed run (needs sudo)"
+    )
     parser.add_argument("--offload-dir", default=None, help="Accelerate disk-offload folder")
-    parser.add_argument("--list", action="store_true",
-                        help="print which baselines can run here, then exit")
+    parser.add_argument(
+        "--list", action="store_true", help="print which baselines can run here, then exit"
+    )
     args = parser.parse_args()
 
     model_keys = [k.strip() for k in args.models.split(",") if k.strip() in MODEL_CONFIGS]
@@ -374,15 +306,19 @@ def main() -> None:
 
     def _persist() -> None:
         with open(out_path, "w") as f:
-            json.dump({
-                "timestamp": ts,
-                "max_new_tokens": MAX_NEW_TOKENS,
-                "runs_per_prompt": n_runs,
-                "cache_mode": "cold" if cold else "warm",
-                "backends": backends,
-                "provenance": bench_common.provenance(),
-                "results": all_results,
-            }, f, indent=2)
+            json.dump(
+                {
+                    "timestamp": ts,
+                    "max_new_tokens": MAX_NEW_TOKENS,
+                    "runs_per_prompt": n_runs,
+                    "cache_mode": "cold" if cold else "warm",
+                    "backends": backends,
+                    "provenance": bench_common.provenance(),
+                    "results": all_results,
+                },
+                f,
+                indent=2,
+            )
 
     for mkey in model_keys:
         cfg = {**ACCEL_DEFAULTS, **MODEL_CONFIGS[mkey]}
@@ -413,13 +349,16 @@ def main() -> None:
                     res = spec["run"](handle, prompt, n_runs, cold)
                     model_results[backend][pid] = res
                     _persist()
-                    print(f" → {_fmt(res['tps'], 3)} tok/s, TTFT {_fmt(res['ttft_ms'], 0)}ms "
-                          f"[{res.get('cache_state', 'warm')}]")
+                    print(
+                        f" → {_fmt(res['tps'], 3)} tok/s, TTFT {_fmt(res['ttft_ms'], 0)}ms "
+                        f"[{res.get('cache_state', 'warm')}]"
+                    )
                 del handle
                 _gc()
             except Exception as exc:  # noqa: BLE001
                 print(f"\n  [{backend} ERROR] {exc}")
                 import traceback
+
                 traceback.print_exc()
                 model_results[backend]["_error"] = str(exc)
                 _persist()
@@ -440,9 +379,11 @@ def _report_model(label: str, backends: list[str], results: dict[str, dict]) -> 
             res = results.get(backend, {}).get(pid)
             if not res or "_error" in results.get(backend, {}):
                 continue
-            print(f"  {pid:<14} {backend:<14} "
-                  f"{_fmt(res['ttft_ms'], 0, 'ms'):>10} {_fmt(res['tps'], 3):>10} "
-                  f"{_fmt(res['ram_gb'], 2, 'GB'):>9}  {res.get('cache_state', 'warm')}")
+            print(
+                f"  {pid:<14} {backend:<14} "
+                f"{_fmt(res['ttft_ms'], 0, 'ms'):>10} {_fmt(res['tps'], 3):>10} "
+                f"{_fmt(res['ram_gb'], 2, 'GB'):>9}  {res.get('cache_state', 'warm')}"
+            )
         print()
 
     # tok/s summary (median across prompts), with SWLP as the reference if present.
@@ -450,8 +391,7 @@ def _report_model(label: str, backends: list[str], results: dict[str, dict]) -> 
     print(f"  {'─' * 60}")
     medians: dict[str, float] = {}
     for backend in backends:
-        vals = [results.get(backend, {}).get(pid, {}).get("tps")
-                for pid, _ in PROMPTS]
+        vals = [results.get(backend, {}).get(pid, {}).get("tps") for pid, _ in PROMPTS]
         vals = [v for v in vals if isinstance(v, (int, float)) and v == v]
         medians[backend] = _median(vals) if vals else float("nan")
     ref = medians.get("swlp")

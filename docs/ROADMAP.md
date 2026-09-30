@@ -1,5 +1,12 @@
 # SWLP — Project Roadmap & Phase History
 
+> Historical phases mention CUDA/MX230; that path was removed 2026-09-20 and SWLP is Apple-Silicon-only.
+>
+> Doc files named in older phases were consolidated (2026-09-30): `hardware_baseline.md`,
+> `swlp_vs_airllm.md` → `results.md`; `benchmark_methodology.md`, `policy_validation.md`,
+> `REPRODUCE.md` → `benchmarking.md`; `scheduler_architecture.md` → `architecture.md`;
+> `model_packaging.md` → `formats.md`; `phase5_design_decisions.md` → the appendix at the end of this file.
+
 This file is the full phase-by-phase history of the SWLP project: goals, task
 lists, completion checklists, and measured numbers for Phases 0–18. It was split
 out of `.claude/CLAUDE.md` so that file can stay a lean operating manual.
@@ -1595,3 +1602,442 @@ on Apple Silicon throughput, plus a terminal UI worth looking at.
 > failed with `[metal::set_wired_limit] Setting a wired limit larger than the
 > maximum working set size is not allowed`. The ceiling is ~74% of RAM and
 > only `sysctl iogpu.wired_limit_mb` (root) moves it. Clamp, then advise.
+
+### Phase 29 — Qwen3.8-27B (hybrid Gated-DeltaNet) streaming: memory, MTP, correctness
+
+Goal: run Qwen/Qwen3.8-27B (64 layers, 48 Gated-DeltaNet + 16 gated
+attention, 48.7 GB fp16 shards) on the M5 16 GB, find where it is slow, fix it
+at bit-identical output. Raw runs: `experiments/qwen38/`.
+
+- [x] **Memory thrash fixed** — baseline process footprint was 10 GB (7.96 GB
+      MPS: embed + lm_head + ~3.8 in-flight layers; 2.3 GB read buffers) on
+      16 GB → swap; the "upload" stage cost 294 ms/layer against 18 ms
+      measured without pressure, SSD read 255 vs 110 ms. `embed_tokens` now
+      stays on CPU, mmap-backed (`runner/load.py`, `LlamaLikeAdapter`):
+      −2.5 GB dirty memory, no speed cost. Footprint 10 → ~6.3 GB (window 1).
+- [x] **Hybrid speculative correctness** (`runner/hybrid_rollback.py`) —
+      `DynamicCache.crop()` cannot roll back DeltaNet recurrent state (raises;
+      the exception was swallowed), so speculative decode on qwen3_5 was
+      silently wrong after the first rejection. Verify now records per-layer
+      conv inputs + (q,k,v,g,β,initial_state) and replays only the accepted
+      prefix — no weights, no second sweep. Also fixed: `call_block` checked
+      `layer_type` but transformers 5.8 names it `block_type`, so every
+      multi-token verify on hybrid models crashed.
+- [x] **Native MTP self-drafter** (`runner/mtp.py`, `--mtp` / `SWLP_MTP`) — the
+      checkpoint's 1-layer multi-token-prediction head (15 tensors, 0.85 GB,
+      resident), previously dropped at shard time; sharder now writes
+      `mtp.safetensors`. vLLM-style forward (post-norm target hidden,
+      `fc(cat[norm(embed), norm(hidden)])`), AIMD draft length shared with
+      `DraftModelDrafter`.
+- [x] **Sharder keeps native dtype** — `dtype_str="auto"` (new default) keeps
+      bf16 checkpoints bf16 (bf16→fp16 loses values < 2⁻¹⁷ and risks DeltaNet
+      overflow); the manifest now records `weight_dtype` (it always claimed
+      float16). Runner `dtype=auto` follows the manifest.
+- [x] **Observability** — plain log formatter prints `extra=` fields (every
+      structured event printed a bare name); httpx/httpcore DEBUG silenced;
+      `ram_peak_bytes` includes MPS driver memory (reported 0.48 GB for a
+      10 GB process); `per_token_latency_seconds` filled; `degradation_count`
+      reports 0 instead of null; timeline header states it is truncated;
+      `qwen3_5_text` registered (spurious unknown-arch warning).
+- [ ] **Re-shard Qwen3.8-27B as bf16** — code done and tested; the on-disk
+      fp16 shards must be deleted first (40 GB free < 54 GB needed). All
+      numbers below are on the fp16 shards.
+- [x] pytest 513 passing, `ruff check src/` clean.
+
+| Run (8–24 tok, M5 16 GB) | tok/s | Notes |
+|---|---:|---|
+| Baseline (defaults, pre-fix) | 0.035 | 10 GB footprint, swapping |
+| Flags only: window 1, prefetch 1, residency off | 0.100 | |
+| Defaults + CPU-mmap embed | **0.135** | peak 8.4 GB, output unchanged |
+| + `--mtp` (max_draft 4) | 0.461 | identical output to plain |
+| + `--mtp` (default max_draft 16) | **0.498** | 14.2× baseline, 0 degradations |
+| + `--mtp` (max_draft 2) | 0.339 | |
+| MLX streaming prototype (plain, not wired) | 0.130 | 7.70 s/tok, 6.8 s SSD wait; window-1-equivalent |
+
+**Phase notes:**
+> **Negative finding, recorded:** splitting each shard read into 2 parallel
+> `pread` slices hit 7.0 GB/s in isolation (vs 6.2 single-stream) but made
+> the real pipeline **3× slower** (reads 217 → 650 ms/layer, reproduced A/B
+> twice) — concurrent giant uncached reads fight the next layer's prefetch.
+> Reverted. Microbenchmarks of the I/O path do not transfer; A/B in-pipeline.
+>
+> PyTorch MPS batched-GEMV slowdown (pytorch#189855) is **not present** in
+> torch 2.14.0 on M5: `[B,1,K]`, `[B,K]`, `[1,B,K]` all ~1.95 ms, B ≤ 14.
+>
+> MLX: `mx.load` reads a shard straight into Metal-visible memory (no CPU
+> staging buffer, no host→device copy); mlx-lm's `qwen3_5.DecoderLayer` takes
+> the HF block-relative shard keys unchanged after a conv1d `moveaxis` and the
+> (1+w) RMSNorm shift. Mixers verified vs HF (corr 1.0000). Next step: an
+> `MlxStreamRunner` with MTP.
+
+### Phase 30 — MLX MoE expert streaming (`--backend mlx-moe`)
+
+Goal: make fine-grained A3B MoE models fast on the M5 16 GB at lossless BF16
+(ask: ~14 tok/s for Qwen3.6-35B-A3B). Test model: OLMoE-1B-7B-0125-Instruct
+(13.4 GB BF16, 16 layers, 64 experts top-8, 12.6 MB/expert, 1.6 GB routed
+bytes/token) — the real target needs ~70 GB of disk that is not free.
+
+- [x] **Diagnosis: the torch MoE path cannot be fast.** `SwlpCachedExperts`
+      costs 3.84 ms/layer at 100% cache hits (no I/O; Qwen3.6-35B-A3B dims) —
+      154 ms/token for 40 layers, a ~6.5 tok/s ceiling. MLX: SwitchGLU 0.60
+      ms/layer; per-expert lazy loop 24.9 ms/token incl. per-layer routing sync.
+- [x] **`runner/mlx_moe.py` `MlxMoeRunner`** — stock `mlx_lm` model for the
+      `model_type` (qwen3_moe / qwen3_5_moe / olmoe), all non-expert weights
+      resident, each MoE block's `switch_mlp` replaced by `CachedSwitchGLU`
+      (`runner/mlx_switch.py`); generation is `mlx_lm.stream_generate`.
+      Budget auto-sized and **clamped to the Metal working set** (a 14 GB
+      budget aborted: kIOGPUCommandBufferCallbackErrorOutOfMemory; M5 limit
+      11.8 GB).
+- [x] **`runner/mlx_expert_cache.py` `MlxExpertCache`** — one small MLX array
+      per expert (in-place slot updates in a stacked array copy the whole
+      array: 5.3 ms/matrix), whole-expert parallel `pread` + F_NOCACHE (8
+      workers; ~8.8 GB/s effective on misses), workers do I/O only (MLX graph
+      construction concurrent with `mx.eval` aborts the process), heap LFU.
+- [x] **Cache policy from real routing traces** (OLMoE, train/test prompts):
+      LRU **0.0%** hits at 8% and 12% of experts (decode sweeps every layer's
+      top-k: reuse distance ≈ one token of experts), LFU 24.7% / 31.2%,
+      Belady 43.8% / 54.2%; popularity pinning from other prompts fails
+      (3.7%). Same-session A/B: LFU = LRU at 1.6 GB, **+42% at 9 GB**
+      (16.6 vs 11.7 tok/s).
+- [x] **Expert prefetch default → `lru`** (no prediction): next-layer router
+      prediction measured slower at every budget (12%: 6.5 vs 9.6 tok/s).
+- [x] Tests: streamed MLX MoE vs resident `mlx_lm` logits (qwen3_moe with a
+      1 MB budget forcing evictions every step, qwen3_5_moe hybrid with the Hub
+      fused `experts.gate_up_proj` layout), LFU-not-LRU, budget invariant under
+      heap rebuilds. pytest 522 passing, ruff clean.
+- [x] **Measured Qwen3.6-35B-A3B itself** (BF16, 66 GB of shards: 40 layers,
+      256 experts top-8, 2.9 GB dense resident, expert banks + MTP head).
+      Output correct and coherent (see table). Untied token embeddings now
+      served from the CPU mmap (`MmapEmbedding`): frees 1.0 GB of Metal
+      working set for experts; logits unchanged (tests).
+
+| OLMoE-1B-7B BF16, M5 16 GB | tok/s | hit rate |
+|---|---:|---:|
+| torch `swlp` MoE path, 9 GB budget | 0.55 | — |
+| mlx-moe, 12% experts cached (LRU, prefetch off) | 8.8 steady | 37% |
+| mlx-moe, 49% (LRU) | 10.4 steady | 78% |
+| mlx-moe, 70% (LRU, first session) | 19.9 steady | 93% |
+| mlx-moe, 70% (LFU vs LRU, later same-session A/B) | 16.6 vs 11.7 | 93% |
+
+| **Qwen3.6-35B-A3B BF16, M5 16 GB (same session, 256 tok)** | **tok/s steady** | **hit rate** |
+|---|---:|---:|
+| budget 2.5 GB (LFU) | 4.4 (p50 219 ms) | 45% |
+| auto budget → 3.3 GB | 4.5 (p50 222 ms) | 52% |
+| max budget → 6.4 GB (Metal clamp) | 4.7–5.0 (p50 189 ms) | 67% |
+| max budget, predictive prefetch | 2.8 (max 9.1 s stall) | 71% |
+| first 32-token cold run (CLI, auto) | 4.4 | 53% |
+
+> Qwen3.6 profile (warm, max budget): the per-layer routing sync
+> (`np.array(indices)`, i.e. attention/DeltaNet + expert GPU work) ≈ 2.9 ms ×
+> 40 layers ≈ 120 ms/token; NumPy→MLX copies of missed experts ≈ 32 ms/token;
+> the rest is waiting on ~1 GB/token of expert reads. Raising hits 45→67%
+> bought only 4.4→4.7 tok/s: at BF16 the ceiling on this machine is ~5 tok/s.
+> Levers beyond it are lossy/opt-in (official FP8 or int8 experts ≈ halve miss
+> bytes and double the cached fraction) or hardware (RAM).
+
+**Phase notes:**
+> Machine drift is large: the same LRU/1.6 GB point measured 8.8 tok/s and,
+> an hour later, 6.2 — compare only within a session. Both policies show rare
+> ~2 s token stalls (max latency) — undiagnosed.
+>
+> Projection for Qwen3.6-35B-A3B (arithmetic, not measured): resident ≈ 4.7 GB,
+> expert budget ≈ 5 GB ≈ 8% of 10,240 experts; ~50% hits (literature) →
+> ~1 GB of misses/token → ~115 ms + ~45 ms compute ≈ **5–7 tok/s at BF16**.
+> 14 tok/s needs ≲0.25 GB of misses/token (≥~88% hits ≈ half the experts
+> cached): not reachable at BF16 in 16 GB. Opt-in int8 / int4 expert tiers,
+> or 32 GB+ RAM, are the levers.
+
+### Phase 31 — 4-bit MLX-checkpoint expert streaming (Gemma 4 26B A4B)
+
+Goal: run `mlx-community/gemma-4-26b-a4b-it-4bit` (15.3 GB — above the M5's
+11.8 GB Metal working set; 30 layers, 128 experts top-8, 3.3 MB/expert,
+~0.8 GB routed/token, ~2.4 GB non-expert) on the 16 GB M5 at ~14 tok/s.
+
+- [x] `mlx-moe` loads MLX-format checkpoints directly (`--model <mlx repo>`,
+      no `--shard-dir`): mlx_lm's lazy loader (quantization + sanitize stay
+      upstream), stacked expert tensors dropped before evaluation, expert byte
+      ranges indexed in place (`model/mlx_expert_index.py`; `ExpertSlice.file`),
+      packed 4-bit experts read + computed with `mx.quantized_matmul` using the
+      replaced module's own activation (GeGLU) and quantization params.
+      Layer-0 check vs stock quantized SwitchGLU: max|diff| 0.0.
+- [x] Runner applies the tokenizer's chat template (mlx_lm CLI default): raw
+      Gemma 4 text has no `<bos>` and degenerates (" of of of …").
+- [x] Tests: 4-bit MLX checkpoint (mlx_lm.convert of a tiny Qwen3-MoE) streamed
+      vs resident mlx_lm — identical greedy tokens, logits within 1e-3.
+      pytest 523 passing (+ known-flaky codec test), ruff clean.
+
+| Gemma 4 26B A4B it, 4-bit, M5 16 GB | tok/s | hit rate |
+|---|---:|---:|
+| stock mlx_lm (full load) | **crash** — Metal OOM (kIOGPU…OutOfMemory) | — |
+| mlx-moe, auto budget 6.5 GB, 256 tok steady | **14.5** (p50 58, p90 112, max 150 ms) | 95.3% |
+| mlx-moe CLI, 128 tok incl. cold start | 11.7 (TTFT 1.8 s, load 1.4 s) | 91.5% |
+| mlx-moe, 3 GB budget, steady | 7.2 | 77.7% |
+
+**Phase notes:**
+> Quality: 4-bit is a lossy, opt-in tier (per the project's rules); the model
+> is the community MLX quantization. A QAT build
+> (`mlx-community/gemma-4-26B-A4B-it-qat-4bit`, Google quantization-aware
+> trained) exists and should be the quality-preferred 4-bit choice.
+>
+> One early 256-token run hung (main thread in a Python lock wait, all read
+> workers idle) with the raw (no-BOS) prompt; not reproduced after the chat
+> template fix, across 3 subsequent runs. Unresolved — kept a watchdog
+> (faulthandler) in the bench script.
+
+---
+
+## Appendix: Phase 5 design decisions (moved from docs/phase5_design_decisions.md)
+
+This document records the clarifying questions raised before implementing Phase 5
+(speculative decoding), the options considered for each, and the reasoning behind
+the chosen option. It also references the Phase 4 decisions for continuity, since
+they directly constrain Phase 5.
+
+The decisions were made "as a CTO" — optimising for **measured performance on the
+real target hardware (M5 16 GB)**, **the project's first-class constraint of zero
+quality compromise**, and **lowest implementation risk**.
+
+---
+
+### Phase 4 decisions (context — already shipped)
+
+Phase 5 builds directly on these, so they are summarised here:
+
+| Question | Decision | Reason |
+|---|---|---|
+| Keep resident layers on the Metal GPU (MPS) or in CPU RAM? | Neither — see below | MPS-resident fragmented the Metal allocator (0.041 tok/s). CPU-RAM-resident triggered the macOS memory compressor (0.080 tok/s). Both were ~6–12× slower than the all-streaming baseline. |
+| Should partial residency be allowed when the model only partly fits RAM? | **No — full-model-fit guard** | On a 16 GB M5 a 14 GB model leaves no headroom; locking a subset of layers in RAM evicts the OS page cache the *streaming* layers need. `plan_residency()` now returns `resident_count=0` unless the whole model fits the usable budget. |
+
+**Key Phase 4 finding that constrains Phase 5:** on this hardware **RAM is the
+binding constraint**. Any design that permanently occupies a large block of RAM
+reintroduces macOS memory compression and a severe slowdown. Phase 5 must not add
+a large resident object.
+
+---
+
+### Phase 5 — Question 1: Draft strategy
+
+**Question.** Speculative decoding needs a fast token *proposer*. Mistral-7B-Instruct-v0.2
+has no official small sibling, and an exact draft must emit token IDs in Mistral's
+32 000-entry vocabulary. Which drafting approach should be implemented?
+
+**Options considered.**
+
+| Option | Memory cost | Tokenizer risk | Notes |
+|---|---|---|---|
+| A. Prompt-lookup (n-gram) decoding | **0 bytes** | **None** | No draft model. Proposes tokens by matching the recent context against earlier n-grams in the prompt + generation. |
+| B. Small draft model (e.g. TinyLlama-1.1B) | ~2.2 GB resident | **High** | TinyLlama uses the Llama-2 tokenizer — *not* byte-identical to Mistral's. Mismatched IDs → near-zero acceptance. |
+| C. Both, config-selectable | — | — | Build A now, wire a switch for B later. |
+
+**Decision: Option A — Prompt-lookup (n-gram) decoding.**
+
+**Reasoning.**
+
+1. **Memory is the binding constraint (Phase 4).** Phase 4 conclusively measured
+   that locking a large object in RAM on a 16 GB M5 triggers the macOS memory
+   compressor and a 6–12× slowdown. A 2.2 GB permanently-resident draft model
+   reintroduces *exactly* the failure mode Phase 4 just diagnosed and fixed.
+   Prompt-lookup has a **zero-byte memory footprint**.
+2. **Tokenizer correctness is free.** Prompt-lookup operates on the *target
+   model's own emitted token IDs* — there is no second vocabulary, so verification
+   is exact by construction. A real draft model with a different tokenizer
+   (TinyLlama's Llama-2 tokenizer ≠ Mistral's) would propose IDs that mean
+   different things, giving near-zero acceptance — a draft model that is *worse
+   than no draft model*.
+3. **The disk sweep dwarfs the draft cost.** A speculative step is one ~2 s,
+   32-layer SSD sweep. The proposer's cost must be negligible against that. An
+   n-gram dictionary lookup is microseconds; a 1.1B-model forward is tens to
+   hundreds of ms of pure, non-overlapped overhead.
+4. **It is genuinely lossless.** Whatever prompt-lookup proposes, the target model
+   verifies greedily — output is bit-identical to plain greedy SWLP. The draft
+   only affects *speed*, never *correctness*.
+5. **The workload favours it.** SWLP's value proposition is long-context FP16
+   inference on consumer hardware — document QA, summarisation, code completion,
+   retrieval-augmented chat. These are exactly the repetition-heavy workloads
+   where prompt-lookup excels (the model frequently re-emits spans of the context).
+6. **Lowest risk, fastest to ship, easiest to test.** No model download, no
+   network dependency, no new package, fully deterministic, unit-testable with
+   plain tensors.
+
+Option C was rejected as speculative abstraction — CLAUDE.md forbids building
+abstractions before a phase requires them. The drafter is a single focused class;
+if a model-based drafter is ever justified, that is a separate task.
+
+---
+
+### Phase 5 — Question 2: Verification mode
+
+**Question.** How should the target model verify (accept / reject) draft tokens?
+
+**Options considered.**
+
+| Option | Quality guarantee | Testability |
+|---|---|---|
+| A. Greedy only | Bit-identical to greedy SWLP output | Exact string equality |
+| B. Greedy + sampling | "Same distribution in expectation" | Statistical, multi-seed, flaky |
+
+**Decision: Option A — Greedy verification only.**
+
+**Reasoning.**
+
+1. **The Phase 5 spec is explicit:** "accepted tokens are identical to greedy
+   big-model output"; the checklist requires "accepted-token output bit-exact vs.
+   greedy SWLP".
+2. **Zero quality compromise is SWLP's first-class constraint.** Greedy
+   verification yields *bit-identical* output to plain greedy SWLP — the strongest
+   possible correctness guarantee, verifiable with a single string-equality check.
+3. **Sampling-based speculative decoding** uses modified rejection sampling;
+   "lossless" weakens to "same distribution in expectation". That cannot be
+   asserted bit-exactly — only via statistical tests over many seeds, which are
+   expensive and flaky.
+4. **The target config is already pure greedy.** `swlp_mistral_mps.toml` uses
+   `temperature = 0.0`, `do_sample = false`, `repetition_penalty = 1.0`. There is
+   no sampling behaviour to preserve.
+5. **Superset for later.** Sampling support is strictly additive and can be added
+   in a future phase if a research need arises — not building it now follows the
+   "only build what the phase requires" rule.
+
+To stay bit-exact even if a future config enables a repetition penalty, the
+verifier applies the runner's *actual* token-selection function per position
+(with the correctly growing prefix), not a bare `argmax`.
+
+---
+
+### Phase 5 — Question 3: KV cache handling
+
+**Question.** Verification processes K draft tokens in one forward; rejected
+tokens must be rolled out of the KV cache. The Phase 2 `CompressedDynamicCache`
+compresses KV per-layer and is hard to roll back. How should the speculative path
+handle the KV cache?
+
+**Options considered.**
+
+| Option | Rollback mechanism | Risk |
+|---|---|---|
+| A. Plain `DynamicCache`, no compression | `DynamicCache.crop()` — a tested primitive | Low |
+| B. Add rollback to `CompressedDynamicCache` | Decompress → crop → recompress every layer, every step | High |
+
+**Decision: Option A — Plain `DynamicCache`, no KV compression on the speculative path.**
+
+**Reasoning.**
+
+1. **KV compression buys almost nothing here.** Phase 2 measured only a **1.10×**
+   ratio — zlib is lossless but KV activations are high-entropy. The speculative
+   path loses negligible memory by not compressing.
+2. **`crop()` is a tested rollback primitive.** `DynamicCache.crop(max_length)`
+   is a first-class transformers operation. The compressed cache compresses each
+   layer's KV immediately after use (the Phase 2 design); rolling it back means
+   decompress → crop → recompress for every layer on every speculative step — both
+   complex *and* slow on the hot path.
+3. **Correctness risk.** `CompressedDynamicCache` has subtle invariants (e.g.
+   `get_seq_length` answers from a recorded length while cold so the attention
+   mask builds correctly). Adding crop/rollback to that state machine is a prime
+   source of hard-to-find bugs. Speculative decoding is already a non-trivial
+   control-flow change; stacking compressed-cache rollback on top multiplies the
+   risk surface for no measured benefit.
+4. **Separation of concerns.** KV compression (Phase 2) solves "KV too big for
+   RAM". Speculative decoding (Phase 5) solves "too many disk sweeps per token".
+   They address different bottlenecks; coupling them now violates Single
+   Responsibility with no payoff.
+5. **They are not both needed for the current target.** For 7B on 16 GB, the KV
+   cache for a few-hundred-token generation is well under 1 GB — KV size is not
+   the binding constraint. The speculative path can safely use a plain cache.
+
+KV compression and speculative decoding are therefore **mutually exclusive** in
+this phase. If a future model genuinely needs both, that is a separate workstream.
+
+---
+
+### Resulting architecture
+
+- `core/speculative.py` — pure logic: `NgramDrafter` (prompt-lookup proposer) and
+  `verify_greedy()` (accept/reject + rollback decision). No I/O, no torch model
+  calls — unit-testable with plain Python.
+- `runner/speculative.py` — `SpeculativeRunner(SWLPRunner)`: reuses the streaming
+  scheduler, adapter, and loader; overrides only the decode loop. `backend = "speculative"`.
+- One disk sweep per speculative step verifies up to K draft tokens; accepted
+  tokens are amortised over that single sweep.
+- Output is bit-identical to greedy SWLP — speculation changes throughput only.
+
+### Phase 32 — CLI redesign: seven commands, automatic backend, rich UI
+
+- [x] Seven commands replace 17 subcommands + a bare `swlp --prompt` path with
+      73 flags: `chat`, `run`, `serve`, `pull`, `models`, `doctor`, `bench`
+      (~10 flags). Removed from the CLI: `download` (→ `pull`), `benchmark`,
+      `suite`, `simulate`, `report`, `suite-report`, `profile`, `package`,
+      `validate-package`, `layer`, `compress-shards`, `help`. Their library code
+      stays where tests/scripts use it; the unused `reporting/` package and
+      `tui.py` were deleted.
+- [x] `cli_resolve.py`: users name a model, SWLP picks the backend — MoE shards
+      or MLX MoE repo → `mlx-moe`; dense shards → `swlp` (`speculative` + MTP
+      when `mtp.safetensors` exists); `-q` → resident `mlx`; plain Hub model →
+      "pull first" with the exact command. `--backend` overrides.
+- [x] `ui.py` (new dep: `rich`, user-approved): header panel, answers streamed
+      as rendered markdown, status line (tok/s · ms/tok · expert hit rate),
+      `/help /clear /think /stats /exit`; reasoning models' thinking hidden by
+      default (`/think` toggles). `doctor` is one screen: machine, what you can
+      run here + the command (speeds only where measured on M5), tuning.
+- [x] Fixes found while doing it: `mlx-moe` had no `stream_tokens` (chat could
+      not use it); its tokenizer ignored config `eos_token_id` (Gemma 4 ran past
+      `<turn|>`); Hub progress bars/auth nags leaked into the UI; the expert
+      cache now warns when low free RAM shrinks it.
+- [x] pytest all passing, ruff clean.
+
+### Phase 33 — CLI follow-ups: answer length, Ctrl+C, `-q` on MoE, `swlp rm`
+
+- [x] Answers were cut at 32 tokens (config default `max_new_tokens = 32`).
+      The CLI now runs until the model's end-of-answer token (`UNTIL_DONE`
+      cap, never reached in practice); `-n/--max-tokens` (also `--max_tokens`,
+      `--max-new-tokens`) caps it.
+- [x] Ctrl+C at the chat prompt exits (it only printed a newline); while an
+      answer streams it stops that answer. Verified in a real PTY.
+- [x] `-q` was silently ignored on local MoE shards (shards matched first).
+      Now `-q int4|int8` on MoE shards quantizes on load (`swlp_moe_quant`):
+      dense weights once via mlx_lm's `quantize_model` (routers at 8-bit),
+      experts as they enter the cache (`mx.quantize`). Test: identical to
+      mlx_lm's quantization of the same checkpoint. Qwen3.6-35B-A3B, same
+      0.2 GB cache (3.3 GB free RAM): hits 5% → 24%, 2.3 → 2.7 tok/s.
+      `-q` on dense shards → resident MLX; on already-quantized MLX repos it
+      is ignored (label says so) — before, it re-quantized Gemma 4 into a
+      13 GB resident copy + a duplicate 14 GB download.
+- [x] `swlp rm MODEL [-y]`: lists shards / HF downloads (default hub and
+      SWLP's cache) / MLX conversions with sizes, deletes after confirmation.
+- [x] `swlp models` shows sizes for MoE aliases too.
+- [x] Discoverability: `-d/--details` on chat/run/serve/bench (and a bare
+      `--backend`) prints the plan without loading — chosen backend and why,
+      every backend's fit for *this* model, and that backend's settings with
+      current values and env names (`SWLP_WINDOW_SIZE`, `SWLP_RESIDENCY`, …).
+      `swlp models -d` shows per-model details. One catalogue
+      (`cli_resolve.BACKENDS_INFO`) feeds help, `-d` and the resolver. Honest
+      statuses: MoE MTP is unsupported by the speculative drafter; `swlp` on
+      MoE shards is the slow torch path.
+
+### Phase 34 — FP8 checkpoints, resident fit check, streaming fixes
+
+- [x] **Block-FP8 checkpoints were sharded into garbage.** `Qwen/Qwen3.8-27B-FP8`
+      stores e4m3 weights + one `weight_scale_inv` per 128×128 block; the
+      sharder cast raw FP8 values to bf16 without the scales (down_proj absmax
+      448 — the e4m3 maximum — mean |x| 76) and copied the scale tensors in.
+      Now dequantized at shard time (fp32 multiply, then bf16), scales
+      dropped; manifest records `source_quant: "fp8"` and labels say
+      "(from FP8 release)". Re-sharded in place: absmax 0.672, identical to
+      the original BF16 Qwen3.8's; "The capital of France is Paris." Other
+      quantized formats (GPTQ/AWQ/…) are refused at pull time. Manifest now
+      also persists `expert_weight_mb` (was dropped on write).
+- [x] `-q` on local dense shards used the typed name as a Hub id (401). Now
+      the manifest's id, plus a fit check before any download/convert: 27B at
+      int4 ≈ 13 GB > 11.8 GB GPU working set → refused with the streaming
+      command.
+- [x] Speculative (MTP) runs streamed only the first token — its decode loop
+      never called the stream callback. Shared `SWLPRunner._emit_tokens`.
+- [x] Profiler timeline/summary printed into every streamed answer and
+      `layer_traces.json` was written to the cwd each run — now only with
+      profiling on. transformers' kernel-fallback notes hidden unless `-v`.
+- [x] Status line counts real tokens (a speculative chunk holds several);
+      answers keep the model's line breaks (CommonMark joined them).
+- [x] Errors print one line + "add -v" instead of a traceback.
+- [x] `--resident N|auto|off` and `--window W` flags for layer streaming
+      (resident = the first N layers kept in RAM). An explicit count the free
+      RAM cannot hold is refused with the largest that fits — as a warning it
+      went ahead and swapped (30 × 761 MB on 16 GB: 7.7 GB swap, no first
+      token in 10 min). mlx/mlx-moe say they ignore the flags.

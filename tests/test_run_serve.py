@@ -1,4 +1,4 @@
-"""Tests for `swlp run` (one-command) and `swlp serve` (OpenAI-compatible)."""
+"""Tests for `swlp serve` (OpenAI-compatible HTTP API)."""
 import json
 import threading
 import urllib.error
@@ -6,43 +6,10 @@ import urllib.request
 
 import pytest
 
-from swlp.cli import main
 from swlp.config import load_config
 from swlp.serve import ModelHandle, make_handler
 
 # ── swlp run ────────────────────────────────────────────────────────────────
-
-
-def test_run_mock_backend(capsys):
-    exit_code = main(["run", "mock-model", "--backend", "mock",
-                      "--prompt", "hello run", "--json"])
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    assert "hello run" in captured.out
-    assert "mock" in captured.out
-
-
-def test_run_requires_model(capsys):
-    exit_code = main(["run"])
-    captured = capsys.readouterr()
-    assert exit_code == 1
-    assert "needs a model" in captured.err
-
-
-def test_run_positional_model_reaches_config(capsys):
-    """The positional MODEL must land in config.model.model_id, not be ignored."""
-    exit_code = main(["run", "whatever-alias", "--backend", "mock",
-                      "--prompt", "x", "--json"])
-    assert exit_code == 0
-
-
-def test_run_chat_flag_dispatches(capsys, monkeypatch):
-    # /quit immediately — verifies the chat path wires up without a model.
-    monkeypatch.setattr("builtins.input", lambda *_: "/quit")
-    exit_code = main(["run", "m", "--backend", "mock", "--chat"])
-    captured = capsys.readouterr()
-    assert exit_code == 0
-    assert "bye" in captured.out.lower()   # farewell printed on /quit
 
 
 # ── serve internals ─────────────────────────────────────────────────────────
@@ -138,7 +105,7 @@ def test_serve_cli_smoke():
     parser = build_parser()
     args = parser.parse_args(["serve", "mistral-7b", "--port", "9999"])
     assert args.command == "serve"
-    assert args.model_pos == "mistral-7b"
+    assert args.model == "mistral-7b"
     assert args.port == 9999
 
 

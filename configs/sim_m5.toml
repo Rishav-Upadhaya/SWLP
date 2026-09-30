@@ -14,7 +14,6 @@ generate_tokens = 64
 kv_bytes_per_token = 4096      # 7B, FP16 KV per token
 device_memory_mb = 16384       # M5 unified RAM (16 GB)
 ram_capacity_mb = 16384        # same pool — unified memory
-pcie_bandwidth_gbps = 153.0    # unified memory: no PCIe hop; model at RAM bandwidth so disk→RAM dominates
 ram_bandwidth_gbps = 153.0     # M5 LPDDR5X unified memory bandwidth
 disk_bandwidth_gbps = 6.93     # measured SSD read speed (phase0_hardware_check.py)
 disk_staging = true            # layers stream from SSD → unified RAM

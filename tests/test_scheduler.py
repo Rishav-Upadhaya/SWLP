@@ -18,18 +18,12 @@ def _make_config(prefetch: bool = False) -> SchedulerConfig:
         window_size=2,
         prefetch_depth=1,
         prefetch=prefetch,
-        double_buffer=False,
-        pin_memory=False,
     )
 
 
 def _accelerator_device() -> torch.device | None:
-    """Return a non-CPU device when one is available (MPS on Apple, else CUDA)."""
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return None
+    """Return MPS when available, else None."""
+    return torch.device("mps") if torch.backends.mps.is_available() else None
 
 
 class _BlockWithBuffer(nn.Module):

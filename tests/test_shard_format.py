@@ -1,10 +1,8 @@
-"""Tests for Phase 17 safetensors shard format.
+"""Tests for the safetensors shard format.
 
 Covers:
 - _save_safetensors writes a valid .safetensors file (plain FP16)
-- _save_safetensors flattens FP8 quant dicts correctly
 - _load_safetensors_shard round-trips plain FP16 state
-- _load_safetensors_shard reconstructs FP8 nested format
 - _safetensors_file_ok integrity check
 - verify_shards detects corrupt safetensors
 - get_layer_path uses correct extension per shard_format
@@ -20,7 +18,6 @@ import torch
 
 from swlp import codec
 from swlp.core.streaming import _load_safetensors_shard
-from swlp.model.quant import dequantize_layer_state, quantize_layer_state
 from swlp.model.shard import (
     ShardManifest,
     _safetensors_file_ok,
@@ -85,37 +82,6 @@ def test_save_safetensors_creates_valid_file(tmp_path: Path) -> None:
     path = tmp_path / "layer.safetensors"
     _save_safetensors(_fp16_state(), path)
     assert _safetensors_file_ok(path)
-
-
-# ── FP8 safetensors round-trip ───────────────────────────────────────────────
-
-def test_fp8_save_and_load_reconstructs_nested(tmp_path: Path) -> None:
-    """_save_safetensors(FP8 quant dict) + _load_safetensors_shard → nested FP8."""
-    state = _fp16_state(hidden=8)
-    fp8_state = quantize_layer_state(state, scheme="float8")
-    path = tmp_path / "layer_fp8.safetensors"
-    _save_safetensors(fp8_state, path)
-    loaded = _load_safetensors_shard(path)
-    assert loaded.get("_swlp_quant") == "float8"
-    assert "weights" in loaded
-
-
-def test_fp8_dequantize_after_safetensors_round_trip(tmp_path: Path) -> None:
-    """FP8 → .safetensors → load → dequantize ≈ original FP16."""
-    state = {
-        "weight": torch.randn(8, 8, dtype=torch.float16),
-        "bias": torch.zeros(8, dtype=torch.float16),
-    }
-    fp8_state = quantize_layer_state(state, scheme="float8")
-    path = tmp_path / "layer_fp8.safetensors"
-    _save_safetensors(fp8_state, path)
-    loaded = _load_safetensors_shard(path)
-    deq = dequantize_layer_state(loaded)
-    assert "weight" in deq
-    # Relative error should be small (FP8 near-lossless).
-    rel = (deq["weight"].float() - state["weight"].float()).abs().mean()
-    orig_abs = state["weight"].float().abs().mean()
-    assert rel / orig_abs < 0.05
 
 
 # ── _safetensors_file_ok ─────────────────────────────────────────────────────

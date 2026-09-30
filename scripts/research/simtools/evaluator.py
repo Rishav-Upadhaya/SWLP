@@ -5,7 +5,7 @@ a side-by-side comparison.  Answers: which policy is fastest, uses least
 RAM, keeps GPU busiest, and has fewest stalls?
 
 Usage:
-    from swlp.core.evaluator import evaluate_policies, EvaluationConfig
+    from scripts.research.simtools.evaluator import evaluate_policies, EvaluationConfig
 
     result = evaluate_policies(
         EvaluationConfig(
@@ -27,8 +27,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .profiler import compute_pipeline_metrics
-from .simulator import SimResult, SimulatorConfig, simulate
+from scripts.research.simtools.simulator import SimResult, SimulatorConfig, simulate
+from swlp.core.profiler import compute_pipeline_metrics
 
 
 @dataclass
@@ -108,14 +108,16 @@ class EvaluationResult:
             print("No evaluation results.")
             return
 
-        print(f"\n{'='*100}")
+        print(f"\n{'=' * 100}")
         print("POLICY EVALUATION COMPARISON")
-        print(f"{'='*100}")
+        print(f"{'=' * 100}")
         print(
             f"  {'Policy':<20} {'Tok/s':>7} {'GPU%':>5} {'Idle%':>5} "
             f"{'Hit%':>5} {'Wait':>6} {'Peak':>7} {'Stalls':>6} {'vs Best':>8}"
         )
-        print(f"  {'-'*20} {'-'*7} {'-'*5} {'-'*5} {'-'*5} {'-'*6} {'-'*7} {'-'*6} {'-'*8}")
+        print(
+            f"  {'-' * 20} {'-' * 7} {'-' * 5} {'-' * 5} {'-' * 5} {'-' * 6} {'-' * 7} {'-' * 6} {'-' * 8}"
+        )
 
         best_throughput = max(r.throughput_tokens_per_sec for r in self.results)
         best_ram = min(r.peak_ram_mb for r in self.results)
@@ -127,8 +129,8 @@ class EvaluationResult:
             )
             print(
                 f"  {r.policy_name:<20} {r.throughput_tokens_per_sec:>7.2f} "
-                f"{r.gpu_efficiency*100:>4.1f}% {r.gpu_idle_pct:>4.1f}% "
-                f"{r.prefetch_hit_rate*100:>4.1f}% {r.avg_ensure_wait_ms:>5.1f} "
+                f"{r.gpu_efficiency * 100:>4.1f}% {r.gpu_idle_pct:>4.1f}% "
+                f"{r.prefetch_hit_rate * 100:>4.1f}% {r.avg_ensure_wait_ms:>5.1f} "
                 f"{r.peak_ram_mb:>6.0f}M {r.pipeline_stall_count:>6} {throughput_pct:>6.1f}%"
             )
 
@@ -137,12 +139,12 @@ class EvaluationResult:
             f"{max(r.throughput_tokens_per_sec for r in self.results):.2f} tok/s"
         )
         print(f"  Best RAM usage: {best_ram:.0f} MB")
-        print(f"  Best GPU efficiency: {best_gpu*100:.1f}%")
+        print(f"  Best GPU efficiency: {best_gpu * 100:.1f}%")
 
         # Cost model summary
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print("COST MODEL ANALYSIS")
-        print(f"{'='*80}")
+        print(f"{'=' * 80}")
         for r in sorted(self.results, key=lambda x: x.throughput_tokens_per_sec, reverse=True):
             reload_cost = r.total_reloads * (r.avg_read_ms + r.avg_upload_ms)
             save_cost = r.resident_count * r.avg_read_ms

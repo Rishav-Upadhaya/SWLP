@@ -75,6 +75,10 @@ def build_runner(config: AppConfig) -> MockRunner | HuggingFaceRunner | MlxRunne
         return MockRunner(config)
     if backend == "mlx":
         return MlxRunner(config)
+    if backend == "mlx-moe":
+        from .mlx_moe import MlxMoeRunner  # lazy: mlx is an optional extra
+
+        return MlxMoeRunner(config)
     if backend == "speculative":
         return SpeculativeRunner(config)
     if backend == "swlp":

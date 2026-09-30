@@ -95,8 +95,6 @@ class RuntimeConfig:
     swlp_window_size: int = 2
     swlp_prefetch_depth: int = 2
     swlp_prefetch: bool = True
-    swlp_double_buffer: bool = True
-    swlp_pin_memory: bool = True
     swlp_fallback_to_baseline: bool = True
     # Re-raise hot-path failures instead of logging and degrading. Off by
     # default (a degraded answer beats no answer); on for clean benchmarks.
@@ -106,41 +104,54 @@ class RuntimeConfig:
     kv_compression: bool = False
     kv_compression_level: int = 0
     kv_tiering: bool = False
-    # Phase 12: disk spill dir for KV overflow (None = no disk spill)
+    # Disk spill dir for KV overflow (None = no disk spill)
     kv_disk_dir: Path | None = None
-    # Phase 16: sliding-window KV budget — keep only the most recent N token
-    # positions of KV (0 = unbounded = Phase 1–15 behaviour).
+    # Sliding-window KV budget — keep only the most recent N token
+    # positions of KV (0 = unbounded).
     kv_window: int = 0
-    # Layer sharding (Phase 1): path to pre-sharded per-layer files
+    # Layer sharding: path to pre-sharded per-layer files
     shard_dir: Path | None = None
-    # Adaptive residency (Phase 4): "auto" | "off" | "<int>" layers
+    # Adaptive residency: "auto" | "off" | "<int>" layers
     swlp_residency: str = "auto"
-    # Direct I/O policy (Phase 20): "auto" | "on" | "off".  "auto" bypasses the
+    # Direct I/O policy: "auto" | "on" | "off".  "auto" bypasses the
     # OS page cache (F_NOCACHE) only when the model cannot fit in available
     # RAM; models that fit get page-cache residency for free.
     swlp_direct_io: str = "auto"
-    # MoE expert streaming (Phase 25): RAM budget for the global expert slot
-    # cache in MB. 0 = auto (a quarter of available RAM, capped at 4 GB).
+    # MoE expert streaming: RAM budget for the global expert slot
+    # cache in MB. 0 = auto (torch path: a quarter of available RAM, capped at
+    # 4 GB; mlx-moe: free RAM, clamped to the Metal working set).
     swlp_expert_cache_mb: int = 0
-    # Expert prefetch mode: "predictive" (routing-history, default) | "lru" |
-    # "off" (cache still works; nothing is prefetched).
-    swlp_expert_prefetch: str = "predictive"
-    # Multi-volume striping (Phase 26): comma-separated extra directories
+    # Expert prefetch mode: "lru" (default) | "predictive" (next-layer
+    # routing prediction) | "off" (cache still works; nothing is prefetched).
+    # Predictive measured SLOWER on M5 at every budget (OLMoE mlx-moe:
+    # 6.5 vs 9.6 tok/s at 12% of experts) — mispredicted reads steal SSD
+    # bandwidth and evict live experts; flash-moe saw -18% on Macs too.
+    swlp_expert_prefetch: str = "lru"
+    # MoE shards only: quantize on load — "none" (lossless, default) | "int8" |
+    # "int4". Dense weights are quantized once; each expert as it enters the
+    # cache, so ~2-3.5x more experts fit. SSD reads stay at shard precision.
+    # Lossy, opt-in (`swlp chat <moe> -q int4`).
+    swlp_moe_quant: str = "none"
+    # Multi-volume striping: comma-separated extra directories
     # holding layer shards. Layers are assigned round-robin across volumes so
     # parallel reads aggregate SSD bandwidth. Empty = single shard_dir.
     swlp_shard_volumes: str = ""
-    # Chunked prefill (Phase 26): feed the prompt through the sweep in chunks
+    # Chunked prefill: feed the prompt through the sweep in chunks
     # of this many tokens (0 = one full-prompt sweep). Bounds activation RAM
     # on very long prompts; lossless — causal attention over prefix KV.
     swlp_prefill_chunk: int = 0
-    # Speculative decoding (Phase 5): prompt-lookup n-gram drafting
+    # Speculative decoding: prompt-lookup n-gram drafting
     swlp_spec_ngram: int = 3
     swlp_spec_max_draft: int = 16
-    # Phase 21: optional resident draft model for SWLP speculative decoding
+    # Optional resident draft model for SWLP speculative decoding
     # (alias or HF id). Must share the target model's tokenizer exactly.
-    # Empty = n-gram prompt-lookup drafting (Phase 5 behaviour).
+    # Empty = n-gram prompt-lookup drafting.
     swlp_draft_model: str = ""
-    # MLX backend (Phase 8): native quantized compute on Apple Silicon.
+    # Draft with the checkpoint's own MTP head (<shard_dir>/
+    # mtp.safetensors, e.g. Qwen3.8-27B). Mutually exclusive with
+    # swlp_draft_model; selects the speculative backend with --shard-dir.
+    swlp_mtp: bool = False
+    # MLX backend: native quantized compute on Apple Silicon.
     # "bf16" (lossless) | "int8" (near-lossless, default) | "int4" (fast tier)
     mlx_quant: str = "int8"
     # ── Apple Silicon tuning (see runner/mlx_tune.py for the rationale) ──
@@ -164,31 +175,17 @@ class RuntimeConfig:
     # Optional draft model for MLX speculative decoding (alias or HF id).
     # Must share the same tokenizer as the main model. Empty = disabled.
     mlx_draft_model: str = ""
-    # Phase 18: INT4 KV quantization — off by default (lossy).
+    # INT4 KV quantization — off by default (lossy).
     # "none" = lossless (default) | "int4" = ~4× smaller KV, ~0.5–1% ppl cost.
     # Must be explicitly opt-in; always labelled in reports.
     kv_quant: str = "none"
-    # ── Phase 23: Quality-neutral speedups ──────────────────────────────────
+    # ── Quality-neutral speedups ──────────────────────────────────
     # Activation cache: cache (prompt_prefix_hash → layer_outputs) for prompt
     # prefix reuse across turns in a chat session. Zero quality impact.
     swlp_activation_cache: bool = True
     swlp_activation_cache_max_entries: int = 16
     # Pre-allocated generate buffer: avoid torch.cat overhead per token.
     swlp_prealloc_buffer: bool = True
-    # ── Phase 23: Opt-in quality tradeoffs (Phase 3 style) ─────────────────
-    # Early exit: skip remaining layers when next-token entropy < threshold.
-    # "off" = disabled (default) | float 0.0-1.0 = entropy threshold.
-    # Lower threshold = more aggressive skipping = faster but more quality risk.
-    # Typical: 0.5 = moderate, 0.3 = aggressive, 0.1 = very aggressive.
-    swlp_early_exit: str = "off"
-    # Layer pruning: remove least-important layers entirely.
-    # "off" = disabled (default) | "light" = remove ~10% | "aggressive" = ~25%
-    # Requires a one-time calibration run per model (profile=True first).
-    swlp_layer_pruning: str = "off"
-    # Adaptive precision: use FP16 for early layers, FP8/INT8 for later layers.
-    # "off" = disabled (default) | "fp8_late" = FP8 for last 50% of layers
-    # | "int8_late" = INT8 for last 50% of layers.
-    swlp_adaptive_precision: str = "off"
 
 
 @dataclass(slots=True)

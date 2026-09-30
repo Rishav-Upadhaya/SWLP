@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 
 import psutil
+import torch
 
 from ..core.residency import build_residency_decision
 from ..core.streaming import has_shards, resolve_direct_io
@@ -31,6 +32,23 @@ LOGGER = logging.getLogger(__name__)
 
 class SWLPSetupMixin:
     """Once-per-run setup and reporting for :class:`SWLPRunner`."""
+
+    def _resolve_dtype(self) -> torch.dtype:
+        """``auto`` computes in the shards' own dtype (bf16 shards → bf16).
+
+        The base rule (fp16 on MPS) is kept for runs without a manifest; a
+        bf16 shard dir under an fp16 skeleton would mix dtypes per layer.
+        """
+        shard_dir = self.config.runtime.shard_dir
+        if (
+            self.config.runtime.dtype.lower() == "auto"
+            and shard_dir is not None
+            and has_shards(shard_dir)
+        ):
+            from ..model.shard import load_manifest
+
+            return getattr(torch, load_manifest(shard_dir).weight_dtype)
+        return super()._resolve_dtype()
 
     def _update_measured_pipeline_ratio(self, measured_ratio: float) -> None:
         """Update measured ratio with smoothing and sanity bounds."""
@@ -186,10 +204,6 @@ class SWLPSetupMixin:
                 rw.swlp_prefetch_depth = int(profile["swlp_prefetch_depth"])
             if "swlp_prefetch" in profile:
                 rw.swlp_prefetch = bool(profile["swlp_prefetch"])
-            if "swlp_pin_memory" in profile:
-                rw.swlp_pin_memory = bool(profile["swlp_pin_memory"])
-            if "swlp_double_buffer" in profile:
-                rw.swlp_double_buffer = bool(profile["swlp_double_buffer"])
             LOGGER.info("applied_tuning_profile", extra={"device": device_key, "profile": profile})
         except Exception:
             LOGGER.exception("apply_tuning_profile_failed")
@@ -253,7 +267,7 @@ class SWLPSetupMixin:
                 extra={"required_bytes": kv_required_bytes, "budget_bytes": kv_budget_bytes},
             )
         kv_stats = self.kv_manager.stats() if hasattr(self, "kv_manager") else {}
-        # Phase 15: prefill_seconds = time from generation_start to first_token_start
+        # Prefill_seconds = time from generation_start to first_token_start
         # (the forward sweep over all input tokens).
         # time_to_first_token_seconds = user-perceived TTFT = prefill + argmax.
         prefill_seconds: float | None = (
@@ -279,13 +293,18 @@ class SWLPSetupMixin:
             total_seconds=total_seconds,
             prefill_seconds=prefill_seconds,
             time_to_first_token_seconds=ttft,
-            per_token_latency_seconds=None,
+            # Decode-only latency: tokens after the first, over the time after TTFT.
+            per_token_latency_seconds=(
+                (generate_seconds - ttft) / (generated_tokens - 1)
+                if ttft is not None and generated_tokens > 1
+                else None
+            ),
             throughput_tokens_per_second=(
                 generated_tokens / generate_seconds if generate_seconds > 0 else None
             ),
             generated_tokens=generated_tokens,
             degradations=list(self.degradations) or None,
-            degradation_count=len(self.degradations) or None,
+            degradation_count=len(self.degradations),
             ram_peak_bytes=peak_rss_bytes if profile else None,
             kv_cache_entries=kv_stats.get("entries"),
             kv_cache_device_bytes=kv_stats.get("device_bytes"),

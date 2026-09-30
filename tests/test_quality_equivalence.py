@@ -12,7 +12,7 @@ Two properties are tested:
 
 NOTE: exact byte-for-byte equality between HF and SWLP is tested at the full-
 model level (Mistral-7B) in scripts/research/quality_equivalence.py and documented in
-docs/swlp_vs_airllm.md. On a randomly-initialized tiny model, FP16 rounding
+docs/results.md. On a randomly-initialized tiny model, FP16 rounding
 differences in shard loading vs in-memory conversion can cause token-level
 divergence (the logit differences are at FP16 epsilon level but deterministic
 rounding breaks can flip the argmax). The CI test here focuses on the property
@@ -31,12 +31,10 @@ from swlp.runner import build_runner
 
 
 def _clear_device_cache() -> None:
-    """Release MPS / CUDA caches between runs to prevent prior-test contamination."""
+    """Release MPS caches between runs to prevent prior-test contamination."""
     gc.collect()
     if torch.backends.mps.is_available():
         torch.mps.empty_cache()
-    elif torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
 TINY_MODEL = "hf-internal-testing/tiny-random-gpt2"
 MAX_NEW_TOKENS = 8

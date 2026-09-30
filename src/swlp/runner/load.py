@@ -114,7 +114,11 @@ def load_from_shards(runner: Any, shard_dir: Path) -> tuple[Any, Any]:
         model = AutoModelForCausalLM.from_config(cfg, dtype=runner.dtype)
     model.eval()
 
-    embed_state = torch.load(str(shard_dir / "embed.pt"), map_location="cpu", weights_only=True)
+    # mmap: the token-embedding table (2.5 GB for 248k-vocab models) stays
+    # file-backed — clean, reclaimable pages; a lookup touches one row/token.
+    embed_state = torch.load(
+        str(shard_dir / "embed.pt"), map_location="cpu", weights_only=True, mmap=True
+    )
     lm_head_state = torch.load(
         str(shard_dir / "lm_head.pt"), map_location="cpu", weights_only=True
     )
@@ -229,7 +233,8 @@ def _materialize_embeddings(
         return
     if hasattr(model, "model") and "embed_tokens" in embed_state:
         inner = model.model
-        inner.embed_tokens.to_empty(device=device)
+        # Stays on CPU (mmap-backed): LlamaLikeAdapter.prepare_step looks rows
+        # up on CPU and moves only [N, T, hidden] to the device.
         inner.embed_tokens.load_state_dict(embed_state["embed_tokens"], assign=True)
         if "norm" in embed_state:
             inner.norm.to_empty(device=device)

@@ -10,7 +10,7 @@ without loading real models.  Enables comparing scheduling strategies under
 identical workloads before touching the real system.
 
 Usage:
-    from swlp.benchmark.event_simulator import (
+    from scripts.research.simtools.event_simulator import (
         EventSimulator, SimConfig, LayerTimings,
         SlidingWindowStrategy, ResidentCacheStrategy,
         AdaptiveResidentStrategy, DynamicSchedulerStrategy,
@@ -25,6 +25,7 @@ Usage:
         result = sim.simulate(num_tokens=10)
         print(result.summary())
 """
+
 from __future__ import annotations
 
 import json
@@ -41,8 +42,10 @@ _MS = 0.001  # 1 ms in seconds
 
 # ── Enums ────────────────────────────────────────────────────────────────────
 
+
 class LayerState(Enum):
     """Lifecycle state of a single transformer layer."""
+
     UNLOADED = "unloaded"
     READING = "reading"
     DESERIALIZING = "deserializing"
@@ -54,6 +57,7 @@ class LayerState(Enum):
 
 class EventType(Enum):
     """Events that advance the simulation."""
+
     PREFETCH_START = "prefetch_start"
     READ_DONE = "read_done"
     DESER_DONE = "deser_done"
@@ -66,17 +70,20 @@ class EventType(Enum):
 
 class OverlapStatus(Enum):
     """Why ensure() blocked or didn't."""
-    HIT = "hit"          # prefetch done before ensure
-    WAIT = "wait"        # prefetch still running
-    MISS = "miss"        # no prefetch at all
+
+    HIT = "hit"  # prefetch done before ensure
+    WAIT = "wait"  # prefetch still running
+    MISS = "miss"  # no prefetch at all
     RESIDENT = "resident"  # loaded from CPU-RAM cache
 
 
 # ── Data Classes ─────────────────────────────────────────────────────────────
 
+
 @dataclass(slots=True)
 class LayerTimings:
     """Per-layer timing profile (all in milliseconds)."""
+
     read_ms: float = 12.0
     deserialize_ms: float = 8.0
     upload_ms: float = 5.0
@@ -106,6 +113,7 @@ class LayerTimings:
 @dataclass(slots=True)
 class SimConfig:
     """Simulation parameters."""
+
     num_layers: int = 32
     layer_weight_mb: float = 450.0
     ram_budget_mb: float = 16000.0
@@ -126,6 +134,7 @@ class SimConfig:
 @dataclass(slots=True)
 class LayerTrace:
     """Per-layer trace from simulation."""
+
     layer: int
     read_start: float = 0.0
     read_end: float = 0.0
@@ -164,6 +173,7 @@ class LayerTrace:
 @dataclass(slots=True)
 class SimulationResult:
     """Aggregated results from a full simulation run."""
+
     strategy_name: str
     num_layers: int
     num_tokens: int
@@ -197,9 +207,9 @@ class SimulationResult:
     def summary(self) -> str:
         """Human-readable summary."""
         lines = [
-            f"{'='*70}",
+            f"{'=' * 70}",
             f"SIMULATION: {self.strategy_name}",
-            f"{'='*70}",
+            f"{'=' * 70}",
             f"Layers: {self.num_layers}  |  Tokens: {self.num_tokens}",
             f"Total: {self.total_seconds:.3f}s  |  Per-token: {self.per_token_ms:.1f}ms  |  "
             f"{self.throughput_toks_per_sec:.2f} tok/s",
@@ -214,15 +224,15 @@ class SimulationResult:
             f"  Wait:       {self.avg_ensure_wait_ms:>7.1f} ms",
             "",
             f"{'Overlap Efficiency':}",
-            f"  Hit rate:   {self.overlap_hit_rate*100:.1f}%",
+            f"  Hit rate:   {self.overlap_hit_rate * 100:.1f}%",
             f"  Hits: {self.overlap_hits}  |  Waits: {self.overlap_waits}  |  "
             f"Misses: {self.overlap_misses}  |  Resident: {self.overlap_residents}",
             "",
             f"{'Resource Utilization':}",
-            f"  GPU busy:   {self.gpu_busy_pct*100:.1f}%",
-            f"  SSD busy:   {self.ssd_busy_pct*100:.1f}%",
+            f"  GPU busy:   {self.gpu_busy_pct * 100:.1f}%",
+            f"  SSD busy:   {self.ssd_busy_pct * 100:.1f}%",
             f"  RAM peak:   {self.ram_peak_layers} layers",
-            f"{'='*70}",
+            f"{'=' * 70}",
         ]
         return "\n".join(lines)
 
@@ -261,6 +271,7 @@ class SimulationResult:
 
 
 # ── Scheduling Strategies ────────────────────────────────────────────────────
+
 
 class SchedulingStrategy(ABC):
     """Base class for scheduling strategies.
@@ -458,6 +469,7 @@ class DynamicSchedulerStrategy(SchedulingStrategy):
 
 # ── Simulator ────────────────────────────────────────────────────────────────
 
+
 class EventSimulator:
     """Discrete-event simulator for SWLP scheduling.
 
@@ -509,6 +521,7 @@ class EventSimulator:
 
         # RNG for jitter
         import random
+
         self._rng = random.Random(config.seed)
 
         # Pre-allocate SSD slots
@@ -719,7 +732,8 @@ class EventSimulator:
                     total_time = token_times[-1] if token_times else 1.0
                     gpu_time = sum(
                         tr.compute_end - tr.compute_start
-                        for tr in prev_token_traces if tr.compute_start > 0 and tr.compute_end > 0
+                        for tr in prev_token_traces
+                        if tr.compute_start > 0 and tr.compute_end > 0
                     )
                     gpu_idle = max(0, 1.0 - gpu_time / total_time) if total_time > 0 else 0.5
                     self.strategy.adjust_from_gpu_idle(gpu_idle)
@@ -786,8 +800,7 @@ class EventSimulator:
     def _loaded_set(self) -> set[int]:
         """Return set of layers currently on device."""
         return {
-            i for i, s in self._layer_state.items()
-            if s in (LayerState.READY, LayerState.COMPUTING)
+            i for i, s in self._layer_state.items() if s in (LayerState.READY, LayerState.COMPUTING)
         }
 
     def _process_pending_until(self, deadline: float) -> None:
@@ -914,6 +927,7 @@ class EventSimulator:
 
 # ── Convenience ──────────────────────────────────────────────────────────────
 
+
 def compare_strategies(
     config: SimConfig,
     timings: LayerTimings,
@@ -940,23 +954,25 @@ def compare_strategies(
 
 def print_comparison(results: list[SimulationResult]) -> None:
     """Print a side-by-side comparison table."""
-    print(f"\n{'='*90}")
+    print(f"\n{'=' * 90}")
     print(f"STRATEGY COMPARISON — {results[0].num_layers} layers, {results[0].num_tokens} tokens")
-    print(f"{'='*90}")
+    print(f"{'=' * 90}")
 
     header = (
         f"{'Strategy':<30} | {'tok/s':>7} | {'ms/tok':>7} | "
         f"{'GPU%':>6} | {'SSD%':>6} | {'Hit%':>6} | {'Wait':>6} | {'RAM':>4}"
     )
     print(header)
-    print(f"{'-'*30}-+-{'-'*7}-+-{'-'*7}-+-{'-'*6}-+-{'-'*6}-+-{'-'*6}-+-{'-'*6}-+-{'-'*4}")
+    print(
+        f"{'-' * 30}-+-{'-' * 7}-+-{'-' * 7}-+-{'-' * 6}-+-{'-' * 6}-+-{'-' * 6}-+-{'-' * 6}-+-{'-' * 4}"
+    )
 
     for r in results:
         print(
             f"{r.strategy_name:<30} | {r.throughput_toks_per_sec:>7.2f} | "
-            f"{r.per_token_ms:>7.1f} | {r.gpu_busy_pct*100:>5.1f}% | "
-            f"{r.ssd_busy_pct*100:>5.1f}% | {r.overlap_hit_rate*100:>5.1f}% | "
+            f"{r.per_token_ms:>7.1f} | {r.gpu_busy_pct * 100:>5.1f}% | "
+            f"{r.ssd_busy_pct * 100:>5.1f}% | {r.overlap_hit_rate * 100:>5.1f}% | "
             f"{r.avg_ensure_wait_ms:>5.1f} | {r.ram_peak_layers:>4}"
         )
 
-    print(f"{'='*90}\n")
+    print(f"{'=' * 90}\n")

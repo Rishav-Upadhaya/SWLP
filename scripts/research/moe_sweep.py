@@ -13,6 +13,7 @@ Usage:
 
 Requires a MoE shard directory produced by the v2 sharder (expert banks).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -76,8 +77,10 @@ def run_budget(
         if StatsRunner.last_expert_stats:
             expert_stats = StatsRunner.last_expert_stats
         else:
-            print(f"  warning: budget {budget_mb} MB produced no expert "
-                  "stats (model has no expert banks?)")
+            print(
+                f"  warning: budget {budget_mb} MB produced no expert "
+                "stats (model has no expert banks?)"
+            )
     del runner
     return {
         "expert_cache_mb": budget_mb,
@@ -91,8 +94,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shard-dir", required=True, help="MoE shard directory (v2 format)")
     parser.add_argument("--model", required=True, help="HuggingFace model id for the tokenizer")
-    parser.add_argument("--budgets", default="0,2048,6144",
-                        help="comma-separated SWLP_EXPERT_CACHE_MB values")
+    parser.add_argument(
+        "--budgets", default="0,2048,6144", help="comma-separated SWLP_EXPERT_CACHE_MB values"
+    )
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--output", default="benchmarks/moe-sweep.json")
@@ -100,8 +104,7 @@ def main() -> int:
 
     budgets = [int(b) for b in args.budgets.split(",") if b.strip()]
     results = [
-        run_budget(args.shard_dir, args.model, b, args.runs, args.max_tokens)
-        for b in budgets
+        run_budget(args.shard_dir, args.model, b, args.runs, args.max_tokens) for b in budgets
     ]
 
     report = {

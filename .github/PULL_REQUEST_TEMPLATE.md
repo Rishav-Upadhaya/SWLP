@@ -2,11 +2,11 @@
 
 ## Checklist
 
-- [ ] `pytest` passes (all tests, no GPU or model download needed)
-- [ ] `ruff check src/` is clean
+- [ ] `pytest` passes (no model download needed)
+- [ ] `ruff check src tests scripts` is clean
 - [ ] New functions have tests in `tests/` (use `MockRunner`, never real models)
 - [ ] Follows the folder layout: runners in `runner/`, algorithms in `core/`,
-      reporters in `reporting/` (see `.claude/CLAUDE.md`)
+      reporters in `reporting/` (see `CONTRIBUTING.md`)
 - [ ] No hardcoded model paths, devices, or magic numbers — config via
       `AppConfig` / TOML / `SWLP_*` env vars
 

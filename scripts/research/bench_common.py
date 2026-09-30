@@ -19,6 +19,7 @@ warm and cold numbers are never silently conflated. ``cache_state`` is stamped
 into every result; if the cache could not actually be dropped (no permission),
 the JSON says so rather than mislabelling a warm run as cold.
 """
+
 from __future__ import annotations
 
 import platform

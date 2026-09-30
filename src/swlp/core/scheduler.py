@@ -21,8 +21,6 @@ class SchedulerConfig:
     window_size: int
     prefetch_depth: int
     prefetch: bool
-    double_buffer: bool
-    pin_memory: bool
 
 
 class PrefetchError(RuntimeError):

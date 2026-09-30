@@ -20,7 +20,7 @@ swlp --backend ... --prompt "..."
 
 - OS / chip (e.g. macOS, M5 16 GB):
 - Python version:
-- Backend (`mock` / `hf` / `swlp` / `speculative` / `mlx`):
+- Backend (`mock` / `hf` / `swlp` / `speculative` / `mlx` / `mlx-moe`):
 - Model:
 - Output of `swlp doctor` (paste):
 

@@ -9,39 +9,41 @@ Runs the event simulator (no model download needed) across:
 
 Outputs all metrics in table format.
 """
+
 from __future__ import annotations
 
-import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+import sys
 
-from swlp.benchmark.event_simulator import (
-    EventSimulator,
-    SimConfig,
-    LayerTimings,
-    SlidingWindowStrategy,
-    ResidentCacheStrategy,
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from scripts.research.simtools.event_simulator import (
     AdaptiveResidentStrategy,
     DynamicSchedulerStrategy,
-    compare_strategies,
+    EventSimulator,
+    LayerTimings,
+    ResidentCacheStrategy,
+    SimConfig,
+    SlidingWindowStrategy,
 )
 
 # ── Model Definitions ────────────────────────────────────────────────────────
 # (name, layers, layer_mb, compute_ms, kv_bytes_per_token, total_gb)
 
 MODELS = [
-    ("Qwen2.5-0.5B FP16",   24,   42,   2.0,   1024,   1.0),
-    ("Qwen2.5-3B FP16",     36,  170,   5.0,   2048,   6.1),
-    ("Qwen2.5-7B FP16",     32,  436,  12.0,   4096,  14.0),
-    ("Qwen2.5-14B FP16",    48,  551,  22.0,   4096,  26.4),
-    ("Mistral-7B FP16",     32,  436,  12.0,   4096,  13.96),
-    ("Mistral-7B FP8",      32,  218,  14.0,   4096,   7.0),
-    ("Qwen2.5-14B FP8",     48,  275,  24.0,   4096,  13.2),
+    ("Qwen2.5-0.5B FP16", 24, 42, 2.0, 1024, 1.0),
+    ("Qwen2.5-3B FP16", 36, 170, 5.0, 2048, 6.1),
+    ("Qwen2.5-7B FP16", 32, 436, 12.0, 4096, 14.0),
+    ("Qwen2.5-14B FP16", 48, 551, 22.0, 4096, 26.4),
+    ("Mistral-7B FP16", 32, 436, 12.0, 4096, 13.96),
+    ("Mistral-7B FP8", 32, 218, 14.0, 4096, 7.0),
+    ("Qwen2.5-14B FP8", 48, 275, 24.0, 4096, 13.2),
 ]
 
 # ── Hardware: M5 16 GB ──────────────────────────────────────────────────────
 RAM_GB = 16384  # MB
-SSD_READ_MS = 12.0    # ~6.93 GB/s → ~436 MB in 12ms (tuned per layer)
+SSD_READ_MS = 12.0  # ~6.93 GB/s → ~436 MB in 12ms (tuned per layer)
 UPLOAD_MS = 5.0
 DESER_MS = 3.0
 EVICT_MS = 0.5
@@ -123,33 +125,39 @@ def run_model_benchmark(
                 gpu_idle_pct = (1.0 - result.gpu_busy_pct) * 100
                 cpu_idle_pct = max(0, 100.0 - result.ssd_busy_pct * 100 - gpu_idle_pct)
                 # SST = steady-state throughput (after warmup token 0)
-                sst_tokens = result.per_token_seconds[1:] if len(result.per_token_seconds) > 1 else result.per_token_seconds
+                sst_tokens = (
+                    result.per_token_seconds[1:]
+                    if len(result.per_token_seconds) > 1
+                    else result.per_token_seconds
+                )
                 sst = len(sst_tokens) / sum(sst_tokens) if sum(sst_tokens) > 0 else 0.0
 
-                rows.append({
-                    "model": model_name,
-                    "layers": num_layers,
-                    "layer_mb": layer_mb,
-                    "total_gb": total_gb,
-                    "strategy": strategy_label,
-                    "window": window,
-                    "prefetch": prefetch_depth,
-                    "resident": resident_count,
-                    "tok_per_sec": result.throughput_toks_per_sec,
-                    "sst_tok_per_sec": sst,
-                    "per_token_ms": result.per_token_ms,
-                    "gpu_busy_pct": result.gpu_busy_pct * 100,
-                    "gpu_idle_pct": gpu_idle_pct,
-                    "cpu_idle_pct": cpu_idle_pct,
-                    "ssd_busy_pct": result.ssd_busy_pct * 100,
-                    "overlap_hit_pct": result.overlap_hit_rate * 100,
-                    "avg_read_ms": result.avg_read_ms,
-                    "avg_compute_ms": result.avg_compute_ms,
-                    "avg_upload_ms": result.avg_upload_ms,
-                    "avg_wait_ms": result.avg_ensure_wait_ms,
-                    "ram_peak": result.ram_peak_layers,
-                    "gb_per_token": result.gb_per_token,
-                })
+                rows.append(
+                    {
+                        "model": model_name,
+                        "layers": num_layers,
+                        "layer_mb": layer_mb,
+                        "total_gb": total_gb,
+                        "strategy": strategy_label,
+                        "window": window,
+                        "prefetch": prefetch_depth,
+                        "resident": resident_count,
+                        "tok_per_sec": result.throughput_toks_per_sec,
+                        "sst_tok_per_sec": sst,
+                        "per_token_ms": result.per_token_ms,
+                        "gpu_busy_pct": result.gpu_busy_pct * 100,
+                        "gpu_idle_pct": gpu_idle_pct,
+                        "cpu_idle_pct": cpu_idle_pct,
+                        "ssd_busy_pct": result.ssd_busy_pct * 100,
+                        "overlap_hit_pct": result.overlap_hit_rate * 100,
+                        "avg_read_ms": result.avg_read_ms,
+                        "avg_compute_ms": result.avg_compute_ms,
+                        "avg_upload_ms": result.avg_upload_ms,
+                        "avg_wait_ms": result.avg_ensure_wait_ms,
+                        "ram_peak": result.ram_peak_layers,
+                        "gb_per_token": result.gb_per_token,
+                    }
+                )
 
     return rows
 
@@ -184,21 +192,27 @@ def run_strategy_comparison() -> list[dict]:
             sim = EventSimulator(config, timings, strat)
             result = sim.simulate(num_tokens=10)
             gpu_idle = (1.0 - result.gpu_busy_pct) * 100
-            sst_tokens = result.per_token_seconds[1:] if len(result.per_token_seconds) > 1 else result.per_token_seconds
+            sst_tokens = (
+                result.per_token_seconds[1:]
+                if len(result.per_token_seconds) > 1
+                else result.per_token_seconds
+            )
             sst = len(sst_tokens) / sum(sst_tokens) if sum(sst_tokens) > 0 else 0.0
-            rows.append({
-                "strategy": strat.name,
-                "window": window,
-                "tok_per_sec": result.throughput_toks_per_sec,
-                "sst_tok_per_sec": sst,
-                "per_token_ms": result.per_token_ms,
-                "gpu_busy_pct": result.gpu_busy_pct * 100,
-                "gpu_idle_pct": gpu_idle,
-                "ssd_busy_pct": result.ssd_busy_pct * 100,
-                "overlap_hit_pct": result.overlap_hit_rate * 100,
-                "avg_wait_ms": result.avg_ensure_wait_ms,
-                "ram_peak": result.ram_peak_layers,
-            })
+            rows.append(
+                {
+                    "strategy": strat.name,
+                    "window": window,
+                    "tok_per_sec": result.throughput_toks_per_sec,
+                    "sst_tok_per_sec": sst,
+                    "per_token_ms": result.per_token_ms,
+                    "gpu_busy_pct": result.gpu_busy_pct * 100,
+                    "gpu_idle_pct": gpu_idle,
+                    "ssd_busy_pct": result.ssd_busy_pct * 100,
+                    "overlap_hit_pct": result.overlap_hit_rate * 100,
+                    "avg_wait_ms": result.avg_ensure_wait_ms,
+                    "ram_peak": result.ram_peak_layers,
+                }
+            )
     return rows
 
 
@@ -226,23 +240,33 @@ def run_early_exit_simulation() -> list[dict]:
         sim = EventSimulator(config, timings, strategy)
         result = sim.simulate(num_tokens=10)
         gpu_idle = (1.0 - result.gpu_busy_pct) * 100
-        sst_tokens = result.per_token_seconds[1:] if len(result.per_token_seconds) > 1 else result.per_token_seconds
+        sst_tokens = (
+            result.per_token_seconds[1:]
+            if len(result.per_token_seconds) > 1
+            else result.per_token_seconds
+        )
         sst = len(sst_tokens) / sum(sst_tokens) if sum(sst_tokens) > 0 else 0.0
 
         # Estimate full-model baseline throughput
-        full_time_per_token = (num_layers * (read_ms + DESER_MS + UPLOAD_MS + compute_ms + EVICT_MS)) / 1000.0
+        full_time_per_token = (
+            num_layers * (read_ms + DESER_MS + UPLOAD_MS + compute_ms + EVICT_MS)
+        ) / 1000.0
         baseline_tps = 1.0 / full_time_per_token if full_time_per_token > 0 else 0.0
 
-        rows.append({
-            "skip_pct": skip_pct,
-            "active_layers": active_layers,
-            "tok_per_sec": result.throughput_toks_per_sec,
-            "sst_tok_per_sec": sst,
-            "per_token_ms": result.per_token_ms,
-            "gpu_busy_pct": result.gpu_busy_pct * 100,
-            "gpu_idle_pct": gpu_idle,
-            "speedup_vs_full": baseline_tps / result.throughput_toks_per_sec if result.throughput_toks_per_sec > 0 else 0,
-        })
+        rows.append(
+            {
+                "skip_pct": skip_pct,
+                "active_layers": active_layers,
+                "tok_per_sec": result.throughput_toks_per_sec,
+                "sst_tok_per_sec": sst,
+                "per_token_ms": result.per_token_ms,
+                "gpu_busy_pct": result.gpu_busy_pct * 100,
+                "gpu_idle_pct": gpu_idle,
+                "speedup_vs_full": baseline_tps / result.throughput_toks_per_sec
+                if result.throughput_toks_per_sec > 0
+                else 0,
+            }
+        )
     return rows
 
 
@@ -270,16 +294,18 @@ def run_speculative_simulation() -> list[dict]:
 
         # Speculative: amortize sweep across N tokens
         effective_tps = result.throughput_toks_per_sec * tokens_per_sweep
-        overhead_pct = (1.0 - 1.0 / tokens_per_sweep) * 100  # theoretical ideal
+        (1.0 - 1.0 / tokens_per_sweep) * 100  # theoretical ideal
 
-        rows.append({
-            "tokens_per_sweep": tokens_per_sweep,
-            "base_tps": result.throughput_toks_per_sec,
-            "effective_tps": effective_tps,
-            "theoretical_speedup": f"{tokens_per_sweep:.1f}x",
-            "gpu_busy_pct": result.gpu_busy_pct * 100,
-            "ssd_busy_pct": result.ssd_busy_pct * 100,
-        })
+        rows.append(
+            {
+                "tokens_per_sweep": tokens_per_sweep,
+                "base_tps": result.throughput_toks_per_sec,
+                "effective_tps": effective_tps,
+                "theoretical_speedup": f"{tokens_per_sweep:.1f}x",
+                "gpu_busy_pct": result.gpu_busy_pct * 100,
+                "ssd_busy_pct": result.ssd_busy_pct * 100,
+            }
+        )
     return rows
 
 
@@ -304,15 +330,20 @@ def main():
 
     # Group by model
     from collections import defaultdict
+
     by_model = defaultdict(list)
     for r in filtered:
         by_model[r["model"]].append(r)
 
     for model_name, rows in by_model.items():
         print(f"\n  {model_name}")
-        print(f"  {'Strategy':<28} {'W':>3} {'R':>3} {'tok/s':>8} {'SST':>8} {'ms/tok':>8} {'GPU%':>6} {'GPU Idle%':>9} {'SSD%':>6} {'Hit%':>6} {'Wait':>7} {'RAM':>4}")
-        print(f"  {'-'*28} {'-'*3} {'-'*3} {'-'*8} {'-'*8} {'-'*8} {'-'*6} {'-'*9} {'-'*6} {'-'*6} {'-'*7} {'-'*4}")
-        for r in sorted(rows, key=lambda x: (-x["tok_per_sec"])):
+        print(
+            f"  {'Strategy':<28} {'W':>3} {'R':>3} {'tok/s':>8} {'SST':>8} {'ms/tok':>8} {'GPU%':>6} {'GPU Idle%':>9} {'SSD%':>6} {'Hit%':>6} {'Wait':>7} {'RAM':>4}"
+        )
+        print(
+            f"  {'-' * 28} {'-' * 3} {'-' * 3} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 6} {'-' * 9} {'-' * 6} {'-' * 6} {'-' * 7} {'-' * 4}"
+        )
+        for r in sorted(rows, key=lambda x: -x["tok_per_sec"]):
             print(
                 f"  {r['strategy']:<28} {r['window']:>3} {r['resident']:>3} "
                 f"{r['tok_per_sec']:>8.3f} {r['sst_tok_per_sec']:>8.3f} "
@@ -327,8 +358,12 @@ def main():
     print("─" * 120)
 
     strat_rows = run_strategy_comparison()
-    print(f"\n  {'Strategy':<30} {'W':>3} {'tok/s':>8} {'SST':>8} {'ms/tok':>8} {'GPU%':>6} {'GPU Idle%':>9} {'SSD%':>6} {'Hit%':>6} {'Wait':>7} {'RAM':>4}")
-    print(f"  {'-'*30} {'-'*3} {'-'*8} {'-'*8} {'-'*8} {'-'*6} {'-'*9} {'-'*6} {'-'*6} {'-'*7} {'-'*4}")
+    print(
+        f"\n  {'Strategy':<30} {'W':>3} {'tok/s':>8} {'SST':>8} {'ms/tok':>8} {'GPU%':>6} {'GPU Idle%':>9} {'SSD%':>6} {'Hit%':>6} {'Wait':>7} {'RAM':>4}"
+    )
+    print(
+        f"  {'-' * 30} {'-' * 3} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 6} {'-' * 9} {'-' * 6} {'-' * 6} {'-' * 7} {'-' * 4}"
+    )
     for r in strat_rows:
         print(
             f"  {r['strategy']:<30} {r['window']:>3} "
@@ -344,8 +379,10 @@ def main():
     print("─" * 120)
 
     early_rows = run_early_exit_simulation()
-    print(f"\n  {'Skip%':>6} {'Active Layers':>13} {'tok/s':>8} {'SST':>8} {'ms/tok':>8} {'GPU%':>6} {'GPU Idle%':>9} {'Speedup':>8}")
-    print(f"  {'-'*6} {'-'*13} {'-'*8} {'-'*8} {'-'*8} {'-'*6} {'-'*9} {'-'*8}")
+    print(
+        f"\n  {'Skip%':>6} {'Active Layers':>13} {'tok/s':>8} {'SST':>8} {'ms/tok':>8} {'GPU%':>6} {'GPU Idle%':>9} {'Speedup':>8}"
+    )
+    print(f"  {'-' * 6} {'-' * 13} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 6} {'-' * 9} {'-' * 8}")
     for r in early_rows:
         print(
             f"  {r['skip_pct']:>5}% {r['active_layers']:>13} "
@@ -360,8 +397,10 @@ def main():
     print("─" * 120)
 
     spec_rows = run_speculative_simulation()
-    print(f"\n  {'Tokens/Sweep':>13} {'Base tok/s':>11} {'Effective tok/s':>15} {'Theoretical':>11} {'GPU%':>6} {'SSD%':>6}")
-    print(f"  {'-'*13} {'-'*11} {'-'*15} {'-'*11} {'-'*6} {'-'*6}")
+    print(
+        f"\n  {'Tokens/Sweep':>13} {'Base tok/s':>11} {'Effective tok/s':>15} {'Theoretical':>11} {'GPU%':>6} {'SSD%':>6}"
+    )
+    print(f"  {'-' * 13} {'-' * 11} {'-' * 15} {'-' * 11} {'-' * 6} {'-' * 6}")
     for r in spec_rows:
         print(
             f"  {r['tokens_per_sweep']:>13} {r['base_tps']:>11.3f} "
@@ -374,9 +413,15 @@ def main():
     print("TABLE 5: FP16 vs FP8 — Throughput & GPU Utilization")
     print("─" * 120)
 
-    fp_rows = [r for r in all_model_rows if r["prefetch"] == 4 and r["window"] == 2 and r["resident"] == 0]
-    print("\n  {'Model':<24} {'Layer MB':>8} {'tok/s':>8} {'SST':>8} {'ms/tok':>8} {'GPU%':>6} {'GPU Idle%':>9} {'SSD%':>6} {'GB/tok':>7}")
-    print(f"  {'-'*24} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*6} {'-'*9} {'-'*6} {'-'*7}")
+    fp_rows = [
+        r for r in all_model_rows if r["prefetch"] == 4 and r["window"] == 2 and r["resident"] == 0
+    ]
+    print(
+        "\n  {'Model':<24} {'Layer MB':>8} {'tok/s':>8} {'SST':>8} {'ms/tok':>8} {'GPU%':>6} {'GPU Idle%':>9} {'SSD%':>6} {'GB/tok':>7}"
+    )
+    print(
+        f"  {'-' * 24} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 6} {'-' * 9} {'-' * 6} {'-' * 7}"
+    )
     for r in fp_rows:
         print(
             f"  {r['model']:<24} {r['layer_mb']:>7.0f}M "
@@ -392,8 +437,10 @@ def main():
     print("─" * 120)
 
     win_rows = [r for r in all_model_rows if r["prefetch"] == 4 and r["resident"] == 0]
-    print(f"\n  {'Model':<24} {'W=2 tok/s':>10} {'W=4 tok/s':>10} {'W=6 tok/s':>10} {'W=2 GPU%':>9} {'W=4 GPU%':>9} {'W=6 GPU%':>9}")
-    print(f"  {'-'*24} {'-'*10} {'-'*10} {'-'*10} {'-'*9} {'-'*9} {'-'*9}")
+    print(
+        f"\n  {'Model':<24} {'W=2 tok/s':>10} {'W=4 tok/s':>10} {'W=6 tok/s':>10} {'W=2 GPU%':>9} {'W=4 GPU%':>9} {'W=6 GPU%':>9}"
+    )
+    print(f"  {'-' * 24} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 9} {'-' * 9} {'-' * 9}")
     by_model_win = defaultdict(dict)
     for r in win_rows:
         by_model_win[r["model"]][r["window"]] = r
@@ -413,8 +460,10 @@ def main():
     print("─" * 120)
 
     pf_rows = [r for r in all_model_rows if r["window"] == 2 and r["resident"] == 0]
-    print(f"\n  {'Model':<24} {'PF=2 tok/s':>10} {'PF=4 tok/s':>10} {'PF=2 GPU Idle':>13} {'PF=4 GPU Idle':>13} {'PF=2 Hit%':>9} {'PF=4 Hit%':>9}")
-    print(f"  {'-'*24} {'-'*10} {'-'*10} {'-'*13} {'-'*13} {'-'*9} {'-'*9}")
+    print(
+        f"\n  {'Model':<24} {'PF=2 tok/s':>10} {'PF=4 tok/s':>10} {'PF=2 GPU Idle':>13} {'PF=4 GPU Idle':>13} {'PF=2 Hit%':>9} {'PF=4 Hit%':>9}"
+    )
+    print(f"  {'-' * 24} {'-' * 10} {'-' * 10} {'-' * 13} {'-' * 13} {'-' * 9} {'-' * 9}")
     by_model_pf = defaultdict(dict)
     for r in pf_rows:
         by_model_pf[r["model"]][r["prefetch"]] = r
@@ -440,9 +489,13 @@ def main():
             if m not in best_by_model or r["tok_per_sec"] > best_by_model[m]["tok_per_sec"]:
                 best_by_model[m] = r
 
-    print(f"\n  {'Model':<24} {'W':>3} {'tok/s':>8} {'SST':>8} {'ms/tok':>8} {'GPU%':>6} {'GPU Idle%':>9} {'SSD%':>6} {'Hit%':>6} {'Total GB':>8}")
-    print(f"  {'-'*24} {'-'*3} {'-'*8} {'-'*8} {'-'*8} {'-'*6} {'-'*9} {'-'*6} {'-'*6} {'-'*8}")
-    for model_name, r in sorted(best_by_model.items(), key=lambda x: -x[1]["tok_per_sec"]):
+    print(
+        f"\n  {'Model':<24} {'W':>3} {'tok/s':>8} {'SST':>8} {'ms/tok':>8} {'GPU%':>6} {'GPU Idle%':>9} {'SSD%':>6} {'Hit%':>6} {'Total GB':>8}"
+    )
+    print(
+        f"  {'-' * 24} {'-' * 3} {'-' * 8} {'-' * 8} {'-' * 8} {'-' * 6} {'-' * 9} {'-' * 6} {'-' * 6} {'-' * 8}"
+    )
+    for _model_name, r in sorted(best_by_model.items(), key=lambda x: -x[1]["tok_per_sec"]):
         print(
             f"  {r['model']:<24} {r['window']:>3} "
             f"{r['tok_per_sec']:>8.3f} {r['sst_tok_per_sec']:>8.3f} "

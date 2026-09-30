@@ -52,10 +52,6 @@ _SAFETENSORS_TORCH_DTYPES: dict[str, torch.dtype] = {
     "F8_E5M2": torch.float8_e5m2,
 }
 
-_FP8_DATA_SUFFIX = "__fp8_data"
-_FP8_SCALE_SUFFIX = "__fp8_scale"
-
-
 def _set_nocache(fd: int) -> None:
     """Disable the unified buffer cache for this fd on macOS (F_NOCACHE)."""
     if sys.platform == "darwin":
@@ -260,36 +256,14 @@ def _safetensors_metadata(data: bytes) -> dict[str, str]:
     return header.get("__metadata__", {}) or {}
 
 
-def nest_fp8_state(flat: dict[str, torch.Tensor]) -> dict:
-    """Reconstruct the nested FP8 dict expected by ``dequantize_layer_state()``.
-
-    FP8 shards store ``{name}__fp8_data`` / ``{name}__fp8_scale`` pairs as flat
-    safetensors keys; ``_swlp_quant`` matches quant.py's ``_QUANT_KEY``.
-    """
-    weights: dict = {}
-    for k, v in flat.items():
-        if k.endswith(_FP8_DATA_SUFFIX):
-            weights.setdefault(k[: -len(_FP8_DATA_SUFFIX)], {})["data"] = v
-        elif k.endswith(_FP8_SCALE_SUFFIX):
-            weights.setdefault(k[: -len(_FP8_SCALE_SUFFIX)], {})["scale"] = v
-        else:
-            # 1-D tensor stored directly (no scale).
-            weights[k] = {"data": v}
-    return {"_swlp_quant": "float8", "weights": weights}
-
-
 def load_safetensors_shard(path: Path, nocache: bool = True) -> dict:
     """Standalone load of a ``.safetensors`` or compressed ``.swz`` shard.
 
-    Plain FP16 shards return a flat ``{name: tensor}`` dict; FP8 shards
-    (metadata ``__swlp_quant__ = float8``) return the nested format expected
-    by ``dequantize_layer_state()``. The result owns its memory and is safe to
+    Returns a flat ``{name: tensor}`` dict. The result owns its memory and is safe to
     retain — used for resident layers and one-off loads. The streaming hot
     path uses :func:`read_shard_payload` + :func:`parse_safetensors_views`
     with a reused buffer instead.
     """
     payload, size, _ = read_shard_payload(path, buffer=None, nocache=nocache)
-    tensors, metadata = parse_safetensors_views(payload, size)
-    if metadata.get("__swlp_quant__", "") == "float8":
-        return nest_fp8_state(tensors)
+    tensors, _ = parse_safetensors_views(payload, size)
     return tensors

@@ -1,531 +1,330 @@
 # Results
 
-## Two measurement tiers
+All measured SWLP numbers are collected here. Unless a row says otherwise, the machine is an
+**Apple M5 with 16 GB unified memory** (LPDDR5X, 153 GB/s) and the decoding is greedy. Phase
+numbers point to the matching entries in [ROADMAP.md](ROADMAP.md). For how the numbers were
+measured, see [benchmarking.md](benchmarking.md).
 
-This document reports two distinct types of measurements. They measure
-different systems and should not be directly compared as if they were
-the same thing.
+## How to read these numbers
 
-### Pipeline simulator (discrete-event)
+- **Cold and warm.** In a *cold* run the page cache was dropped before every timed run, so the
+  SSD was really in the loop. In a *warm* run the shards may have been served from RAM, so the
+  number is an upper bound. *Direct I/O* means the shard reads bypassed the page cache with
+  `F_NOCACHE`, which forces SSD reads without a `purge`.
+- **Before and after Phase 20.** Phase 20 (2026-06-11) removed three full-shard copies per
+  layer per token. Streaming numbers from before it and after it are not comparable.
+- **Precision tiers.** FP16/BF16 streaming is lossless. MLX `int8` gave output byte-identical to
+  FP16 on Mistral-7B. `int4` and 4-bit checkpoints are a separate, lossy reference tier.
+- **Single runs.** Most rows are development runs with n = 1 to 3. The paper-grade
+  re-measurement (at least 5 runs, median and IQR, cold and warm) is still open work.
 
-Models the **scheduling pipeline** only: SSD → Deserialize → Upload → Compute → Evict.
-Does **not** include tokenizer overhead, attention kernel cost, Python/framework
-overhead, synchronization, kernel launch latency, or OS scheduling.
+## Summary
 
-Useful for: comparing scheduling strategies, understanding overlap efficiency,
-measuring GPU idle ratio, predicting which strategy wins on a given hardware
-configuration.
+| Model (on-disk size) | Configuration | tok/s | Conditions |
+|---|---|---:|---|
+| Mistral-7B FP16 (13.96 GB) | `swlp`, W=2 | **0.372** | Direct I/O, after Phase 20, median of 3, 8 tokens |
+| Mistral-7B FP16 | `swlp`, W=2 | 0.174 | Cold (`purge`), before Phase 20, 3-prompt mean |
+| Mistral-7B FP16 | `swlp`, W=2 | 0.210 | Warm, before Phase 20, mean of 3 per-prompt medians |
+| Mistral-7B FP16 | AirLLM 2.11.0 | 0.085 | Warm, same harness and prompts as the 0.210 row |
+| Qwen2.5-14B FP16 (26.4 GB) | `swlp`, W=2 | 0.187–0.197 | Direct I/O, after Phase 20 |
+| Qwen2.5-14B FP16 | `speculative` + Qwen2.5-0.5B draft | **0.545–1.158** | Direct I/O. Depends on acceptance. Output identical. |
+| Qwen3.8-27B fp16 (48.7 GB) | `speculative --mtp` | 0.498 | 8–24 tokens. Output identical. |
+| Mistral-Small-24B FP16 (~44 GB) | `swlp`, W=2 | 0.081 | Warm, before Phase 20, 3.76 GB peak RAM |
+| Mistral-7B | `mlx --quant int8` | 16.0 | Byte-identical to FP16 |
+| Mistral-7B | `mlx --quant int4` | 27.9 | Lossy |
+| Qwen2.5-14B | `mlx --quant int4` | 13.8 | Lossy. int8 runs out of memory. |
+| Gemma 4 26B A4B, 4-bit (15.3 GB) | `mlx-moe` | 14.5 | Steady state, 95% expert hits. Stock mlx_lm runs out of memory. |
+| Qwen3.6-35B-A3B BF16 (66 GB) | `mlx-moe` | 4.4–5.0 | Steady state. About 5 tok/s is the BF16 ceiling on 16 GB. |
 
-**Pipeline ratio** (used throughout) is defined as:
+**Streaming ceiling.** Throughput is capped at `tok/s ≤ SSD bandwidth / bytes per token`.
+Phase 0 measured the SSD at 6.93 GB/s, which gives 0.496 tok/s for Mistral-7B and 0.158 tok/s
+for 24B. The paper's cold analysis used the 6.5 GB/s that `detect_hardware()` reported at the
+time, which gives a 0.465 tok/s ceiling for 7B. Against 0.496:
 
-```
-Pipeline Ratio = (SSD Read + Deserialize + Upload) / Block Compute
-```
+| Measurement | Fraction of the 7B ceiling |
+|---|---|
+| Cold 0.174 | 35% |
+| Direct-I/O 0.372 (after Phase 20) | 75% |
 
-This is the ratio of I/O time to compute time per transformer block. A ratio > 1
-means I/O-bound (streaming helps). A ratio < 1 means compute-bound (streaming
-has limited benefit).
+## Hardware baseline (Phase 0)
 
-### End-to-end inference
+| Metric | M5 16 GB |
+|---|---|
+| SSD sequential read / write | 6.93 / 4.48 GB/s (`scripts/phase0_hardware_check.py`) |
+| MPS 1k×1k matmul | 4.2 ms |
+| MLX 1k×1k matmul | 3.5 ms |
+| Unified memory bandwidth | 153 GB/s (spec) |
+| tiny-gpt2, `hf` | 100.3 tok/s, 4.35 s load |
+| tiny-gpt2, `swlp` W=4 | 111.1 tok/s, TTFT 5.85 ms (fits in RAM, so SSD streaming isn't exercised) |
 
-Measures **actual tok/s** from prompt to final token, including all overhead:
-tokenizer, attention, KV cache management, Python runtime, Metal/CUDA kernel
-launch, synchronization, and framework bookkeeping.
+## Mistral-7B FP16 streaming
 
-Useful for: real-world performance claims, comparison with other systems
-(MLX-lm, Ollama, HF transformers, AirLLM).
+`unsloth/mistral-7b-instruct-v0.2`: 32 layers of 436 MB, 13.96 GB in total. Every SWLP number
+ever reported for this configuration is listed below with its conditions. Only the unmarked
+rows should be quoted.
 
-The gap between simulator and end-to-end is the **runtime overhead** —
-typically 5–15× on Apple Silicon due to per-token materialization, Metal
-allocator fragmentation, and Python GIL contention.
+| tok/s | Date / phase | Conditions | Status |
+|---:|---|---|---|
+| 0.40 | Phase 1 | 16 tokens, cache state not controlled | Historical |
+| 0.422 | Phase 3 (`benchmarks/phase3.json`) | 1 run, 1 prompt, cache state not controlled | Superseded |
+| 0.502 / 0.505 | Phase 3/4 multi-run | Warm-up left the model in the page cache | **Invalid as streaming**: above the 0.496 ceiling |
+| 0.210 | 2026-05-21 | Warm, 3 prompts × 2 runs, same harness as AirLLM | Warm reference |
+| ~0.21 (0.240 / 0.218 / 0.185) | 2026-05-29, Phase 19 | Warm, hardened harness, reproduced | Warm reference |
+| 0.174 (0.133 / 0.186 / 0.203) | 2026-05-30 | **Cold**: `purge` before each run, `--skip-airllm`, TTFT 5.3 s, 0.78 GB RAM | Cold reference before Phase 20 |
+| 0.218 → **0.372** | 2026-06-11, Phase 20 | Direct I/O, 8 tokens, median of 3 (0.360 / 0.372 / 0.379). Prefill 5.86 → 2.30 s. RAM 1.17 GB. | Current |
+| 0.390 | 2026-06-11, Phase 22 | Direct I/O, W=4, prefetch depth 2, 6-token probe | Current |
 
----
+The 0.174 cold run is recorded in the paper notes (`research/research.md`, Table VI). ROADMAP
+Phase 19 still lists the cold run as pending. The same cold measurement hasn't been repeated
+since Phase 20.
 
-## Summary of measured results
+### Window size (Phase 1, 16 tokens)
 
-### Mistral-7B FP16 on M5 16 GB (end-to-end)
+| W | tok/s | TTFT | RAM peak |
+|---|---:|---:|---:|
+| **2** | **0.40** | 6 ms | 1.40 GB |
+| 4 | 0.29 | 14 ms | 1.03 GB |
+| 6 | 0.25 | 22 ms | 0.93 GB |
 
-> ## ⚠️ Benchmark-integrity update (Phase 19, 2026-05-29)
->
-> An audit found the Mistral-7B W=2 FP16 throughput cited as **three different
-> numbers** (0.21 / 0.42 / 0.50 tok/s) across the docs, used interchangeably. The
-> tables below are **historical record** — read them with these corrections:
->
-> - **0.505 tok/s is not a cold-streaming number.** It exceeds the cold-SSD
->   ceiling (0.496 tok/s = 6.93 GB/s ÷ 13.96 GB), which is physically impossible
->   for streaming from disk — it was measured from **warm OS page cache**.
-> - **0.422 tok/s** (phase3.json) was a single uncontrolled-cache run.
-> - **Reproduced warm-cache median (2026-05-29, hardened same-harness):**
->   SWLP **~0.21 tok/s** (0.240 / 0.218 / 0.185 across P1/P2/P3),
->   AirLLM **~0.10 tok/s** (prior same-harness) → **SWLP ~2× faster, warm**.
-> - **Authoritative cold-SSD numbers are pending** a `sudo` re-measurement
->   (`sudo .venv/bin/python scripts/research/compare_airllm_swlp.py --models 7b --cold`).
->
-> Methodology, provenance rules, and the full reconciliation are in
-> [`benchmark_methodology.md`](benchmark_methodology.md). The SWLP-vs-AirLLM
-> *direction* (≈2× faster, lower TTFT, lower RAM) is robust across all runs; only
-> the absolute SWLP number was inflated by warm cache.
+W=2 was the fastest window end to end. Larger windows increase unified-memory contention
+between prefetch and MPS compute. A synthetic pipeline with 80 ms of compute per layer showed
+the opposite trend in overlap gain (W=2: 18.9%, W=4: 30.0%, W=6: 36.3%), so the synthetic
+result did not transfer to real runs.
 
-Comparison table for the paper. All numbers measured on **M5 (Apple Silicon,
-16 GB unified memory)** with **Mistral-7B** (`unsloth/mistral-7b-instruct-v0.2`),
-32 new tokens, greedy decoding, identical prompt:
+## SWLP vs AirLLM
 
-> "Explain in one sentence what makes a Macbook Air good for development."
+This is a same-harness, warm-cache comparison from 2026-05-21, with AirLLM 2.11.0, FP16, 32 new
+tokens, 2 timed runs per prompt (median) and 1 warm-up. It was run before Phase 20.
 
-Raw data: `benchmarks/phase3.json` (harness: `scripts/research/phase3_baselines.py`).
-The MX230 / NVIDIA column is **pending** — to be filled on the Pop!_OS machine.
+| Prompt | SWLP tok/s | AirLLM tok/s | Speed-up | SWLP TTFT | AirLLM TTFT | SWLP RAM | AirLLM RAM |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| P1 `What is 2+2?` | 0.202 | 0.099 | 2.04× | 4.71 s | 10.43 s | 0.79 GB | 1.83 GB |
+| P2 attention paragraph | 0.214 | 0.102 | 2.10× | 6.02 s | 9.38 s | 0.97 GB | 1.70 GB |
+| P3 solar system | 0.213 | 0.053 ¹ | 4.02× | 5.15 s | 20.58 s | 1.21 GB | 1.52 GB |
+| **Mean** | **0.210** | **0.085** | **2.5×** | 5.29 s | 13.47 s | 1.21 GB peak | 1.83 GB peak |
 
----
+¹ AirLLM slowed down on P3 after two consecutive 14 GB sweeps because the macOS memory compressor
+kicked in. The two numbers quoted elsewhere for AirLLM are both from this table: 0.099 is P1
+alone, and **0.085 is the 3-prompt mean**. On P1 and P2, where AirLLM wasn't degraded, the
+speed-up is about 2.0–2.1×.
 
-## How to read this table — two tiers
+- **Quality.** Both systems produce semantically equivalent completions. Wording diverges
+  because PyTorch/MPS and MLX round FP16 differently.
+- **Cold SWLP vs warm AirLLM.** SWLP cold (0.174) against AirLLM warm (0.085) is 2.05×. AirLLM
+  has not been measured cold.
+- **Earlier comparison.** The Phase 3 comparison (SWLP 0.422 vs AirLLM 0.208, 2.03×, TTFT
+  13.6 ms vs 6.54 s) used single uncontrolled-cache runs. It's superseded by the table above.
+- **Attribution.** The RAM advantage and the `head_dim` compatibility (below) are robust
+  results. The paper does not attribute the throughput gap only to prefetch, because AirLLM's
+  MLX path wasn't isolated.
 
-SWLP's first-class constraint is **zero quality compromise** (FP16, no
-quantization). A fair speed comparison must therefore separate two tiers:
+### Mistral-Small-24B (FP16, about 44 GB)
 
-- **FP16 / lossless tier** — bit-exact FP16 weights. This is the apples-to-apples
-  comparison and where the paper's headline speedup is computed.
-- **Quantized reference tier** — 4-bit weights. Faster, but *not* equal quality.
-  Listed as a reference ceiling, not a like-for-like competitor.
-
----
-
-## FP16 / lossless tier (equal quality)
-
-| System | Backend | tok/s | TTFT | Generate (32 tok) | Peak RAM | Feasible on 16 GB? |
-|---|---|---|---|---|---|---|
-| **SWLP** (W=2) | sliding-window SSD→RAM streaming | **0.422** | **13.6 ms** | **75.9 s** | **1.13 GB** | ✅ yes |
-| AirLLM | layer-by-layer streaming | 0.208 | 6.54 s | 153.8 s | — | ✅ yes |
-| MLX-lm (FP16) | naive full-model load | — | — | — | ~14 GB | ❌ **OOM** |
-| HF transformers (FP16) | naive full-model load | — | — | — | ~14 GB | ❌ **OOM** |
-
-**Naive full-model load does not fit.** A 7B FP16 model is ~14 GB; loading it
-whole on a 16 GB M5 aborts with a Metal out-of-memory error (MLX-lm's FP16
-conversion crashes; HF `from_pretrained` to MPS hits the same wall). This is the
-exact problem SWLP and AirLLM exist to solve — only the two streaming runtimes
-produce a result at all.
-
-## Quantized reference tier (NOT equal quality — 4-bit)
-
-| System | Backend | Quant | tok/s | TTFT | Generate (32 tok) | Peak RAM |
-|---|---|---|---|---|---|---|
-| Ollama | llama.cpp full-model | Q4_K_M | 28.25 | 61 ms (warm) | 1.16 s | — |
-| MLX-lm | naive full-model | 4-bit | 29.96 | 1.11 s | 2.20 s | 4.36 GB |
-
-4-bit quantization shrinks Mistral-7B to ~4 GB, so it loads whole and runs
-~70× faster than FP16 streaming — but at a quality cost SWLP explicitly refuses
-to pay. Ollama's cold TTFT (first request, model not resident) was 15.9 s; the
-61 ms figure is the warm steady state.
-
----
-
-## Headline result — SWLP vs AirLLM (FP16 tier)
-
-The paper's central claim is *"SWLP beats AirLLM on speed at equal quality."*
-Both run identical FP16 Mistral-7B weights — quality is identical by construction.
-
-| Metric | AirLLM | SWLP (W=2) | SWLP advantage |
-|---|---|---|---|
-| Throughput | 0.208 tok/s | 0.422 tok/s | **2.03× faster** |
-| Generate time (32 tok) | 153.8 s | 75.9 s | **50.7% faster** |
-| TTFT | 6.54 s | 13.6 ms | **481× lower** |
-
-Speedup vs AirLLM: `(153.8 − 75.9) / 153.8 = 50.7%`. **SWLP shows a positive
-speedup over AirLLM at equal (FP16, lossless) quality — Phase 3 goal met.**
-
-**Why SWLP wins:**
-- *Throughput* — SWLP overlaps the next layers' SSD→RAM transfer with current-layer
-  compute via background prefetch (Phase 1: 36% overlap gain). AirLLM loads each
-  layer, computes, evicts — strictly sequential, no overlap.
-- *TTFT* — SWLP keeps embeddings + `lm_head` + norms permanently resident and
-  prefetches the window, so the first token emerges in milliseconds. AirLLM pays
-  a full 32-layer disk sweep before it can emit token one.
-
----
-
-## Quality check
-
-All FP16-tier completions are coherent and on-topic; SWLP and AirLLM produce
-semantically equivalent answers (both describe processor, storage, battery,
-weight). SWLP's KV path is lossless (Phase 2: zlib is bit-exact), so SWLP
-introduces **zero quality loss** relative to a full-model FP16 run.
-
----
-
-## SWLP window sweep (Mistral-7B)
-
-End-to-end SWLP on Mistral-7B, M5, by sliding-window depth W:
-
-| Window W | tok/s | TTFT | RAM peak | Source |
-|---|---|---|---|---|
-| **W=2** | **0.422** | 13.6 ms | 1.13 GB | Phase 3 (`benchmarks/phase3.json`) |
-| W=4 | 0.29 | 14 ms | 1.03 GB | Phase 1 (`docs/hardware_baseline.md`) |
-| W=6 | 0.25 | 22 ms | 0.93 GB | Phase 1 (`docs/hardware_baseline.md`) |
-
-**W=2 is the best end-to-end window on M5** — a small window minimises
-unified-memory pressure between CPU prefetch and GPU compute. (The synthetic
-ThreadedPipeline POC favoured larger W for hiding pure SSD latency; the real
-run inverts this. See Phase 1 notes.)
-
-### `swlp suite` structured-JSON artifact
-
-`swlp suite` always runs an HF *full-model* baseline per prompt before the SWLP
-cases. Mistral-7B FP16 cannot full-load on 16 GB (hard OOM aborts the process),
-so the suite cannot run on Mistral here. The suite tooling is therefore
-validated on **tiny-gpt2** (a full-loadable model) to produce the structured
-`SuiteResult` JSON: `benchmarks/suite-20260520T044433Z.json`
-(config: `configs/suite_phase3.toml` + `configs/baseline.toml`).
-
-| | Baseline (HF) | SWLP (best, W=4) |
+| | SWLP (W=2, warm) | AirLLM |
 |---|---|---|
-| Throughput | 40.7 tok/s | 325.0 tok/s |
-| Quality overlap vs baseline | — | 1.00 (identical) |
+| Runs? | Yes | **No.** It crashes with `[rope] dims must not exceed … (128) but got 160` |
+| tok/s | 0.081 (P1/P2/P3: 0.078 / 0.081 / 0.085), 51% of the 0.158 ceiling | — |
+| TTFT | 12.65 s | — |
+| Peak RAM | 3.76 GB | — |
+| Disk needed | about 44 GB of shards | HF weights plus `.mlx` shards, about 2× the model size |
 
-The Mistral-7B paper numbers come from the dedicated `scripts/research/phase3_baselines.py`
-harness, which does not require a full-model baseline.
+AirLLM computes `rope_dims = hidden_size / num_heads = 160` and ignores the config's explicit
+`head_dim = 128`. SWLP reads `head_dim` from the config.
 
----
+## Quantized reference tier (Phase 3, Mistral-7B)
 
----
+This tier is not equal quality. It fits in RAM, so it isn't streaming.
 
-## Phase 4 — Adaptive residency (M5 16 GB finding)
+| System | Quant | tok/s | TTFT | Peak RAM |
+|---|---|---:|---:|---:|
+| Ollama (llama.cpp) | Q4_K_M | 28.25 | 61 ms warm, 15.9 s cold | — |
+| MLX-lm | 4-bit | 29.96 | 1.11 s | 4.36 GB |
+| MLX-lm / HF transformers | FP16 full load | — | — | Out of memory (~14 GB model) |
 
-**Goal:** Reduce per-token disk I/O by caching layers in RAM.
-
-**Finding:** On M5 16 GB with Mistral-7B FP16 (13.96 GB), adaptive residency does
-**not improve throughput** due to insufficient RAM headroom.
-
-| Configuration | tok/s | TTFT | RAM peak | Notes |
-|---|---|---|---|---|
-| SWLP W=2 (Phase 3, all streaming) | 0.502 | 13.6 ms | 1.13 GB | Reference |
-| Phase 4: MPS-resident (17 layers locked on Metal) | 0.041 | — | ~9 GB | Metal allocator fragmentation |
-| Phase 4: CPU-RAM resident (17 layers in Python heap) | 0.080 | 108 ms | ~9 GB | macOS memory compressor triggered |
-| Phase 4: fixed `auto` (full-model-fit guard → 0 resident) | **0.505** | 10.6 ms | 1.47 GB | ✅ Phase 3 speed restored |
-
-**Root cause of both residency failures:** 17 resident layers × 436 MB = 7.4 GB
-locked in memory starves the OS page cache for the 15 streaming shards (6.5 GB).
-macOS triggers its memory compressor, adding massive latency to every memory
-access across the process.
-
-**Fix:** `plan_residency()` now includes a **full-model-fit guard** — residency is
-only enabled when `total_model_bytes ≤ usable_budget`. On M5 16 GB:
-usable = (16−4−2) × 0.75 = 7.5 GB < 13.96 GB → 0 resident layers → all streaming.
-
-**Condition for residency to help:** the full model must fit within 75% of
-`(total_ram − 6 GB)`. For 7B FP16 this requires ≥ 32 GB unified memory.
-For smaller models (GPT-2, 1B, 3B), all layers become resident on 16 GB.
-
----
-
-## Phase 5 — Speculative decoding (prompt-lookup)
-
-**Goal:** Verify multiple tokens per disk sweep so throughput is no longer
-capped at one token per 32-layer SSD read.
-
-**Approach:** prompt-lookup (n-gram) speculative decoding — no draft model. An
-n-gram drafter proposes up to K=8 continuation tokens by matching the trailing
-3-gram against earlier context; the streamed Mistral-7B verifies all K in a
-single disk sweep. Output is **bit-identical to greedy SWLP** (lossless by
-construction). See `docs/phase5_design_decisions.md` for the design rationale.
-
-All runs on M5 (Apple Silicon, 16 GB), Mistral-7B FP16, greedy decoding.
+## Adaptive residency
 
-| Workload | Drafts proposed / accepted | Acceptance | tokens / sweep | tok/s | vs 0.505 baseline |
-|---|---|---|---|---|---|
-| Novel text (standard prompt, 32 tok) | 0 / 0 | — (no n-gram recurs) | 1.03 | 0.471 | 0.93× (drafting overhead) |
-| Mildly repetitive ("repeat" prompt, 32 tok) | 6 / 6 | 100% | 1.28 | 0.578 | 1.15× |
-| Repetition-heavy (pattern continuation, 48 tok) | 35 / 35 | 100% | **4.00** | **1.66** | **3.29×** |
-
-**Key results.**
-
-- **Lossless confirmed.** The standard-prompt completion is byte-for-byte
-  identical to the Phase 3/4 greedy SWLP output ("A MacBook Air is an excellent
-  choice for development due to its powerful processor, large storage capacity,
-  long battery life, lightweight design, and compatibility"). Speculation
-  changes throughput only, never the tokens.
-- **When the drafter fires, acceptance is 100%.** Prompt-lookup proposes exact
-  spans of prior context; whenever the model is genuinely continuing a repeated
-  span, the target verifies every proposed token. The variable is *how often* a
-  matching n-gram exists, not whether proposals are accepted.
-- **Speedup scales with output repetitiveness.** Novel free-form text has no
-  recurring n-grams → 0 drafts → speculative decoding degrades gracefully to
-  baseline minus a small (~7%) drafting overhead. Repetition-heavy output
-  (long-context QA that quotes the source, code, structured/list output) reaches
-  **3.29× at 4.0 tokens/sweep**. The ceiling with K=8 is ~9× (9 tokens/sweep).
-- **Zero extra RAM.** Prompt-lookup needs no draft model — critical on the
-  memory-bound 16 GB M5 (peak RAM stayed ~1.0–1.2 GB, same as plain SWLP).
-
-**Honest framing.** Speculative decoding is not a universal speedup; it is a
-*workload-dependent* one. It is free (lossless, ~zero memory) and never
-materially slower than baseline, and it is dramatically faster exactly on the
-workloads SWLP targets — long-context inference where the answer echoes the
-context.
-
----
-
-## Phase 6 — Model-ladder climb: 14B rung (Qwen2.5-14B-Instruct)
-
-**Goal:** Prove SWLP can stream a 14B FP16 model on a 16 GB M5 that cannot
-full-load such a model at all.
-
-**Model:** `Qwen/Qwen2.5-14B-Instruct` — 48 transformer layers, 5120 hidden dim,
-`float16`. Sharded via stream-shard rewrite (no full-model RAM load during sharding).
-
-| Property | Value |
-|---|---|
-| Total sharded weight | 26.4 GB (48 × 550.5 MB/layer) |
-| Shard format | 48 × `layer_NNN.pt` + `embed.pt` + `lm_head.pt` |
-| Sharding RAM peak | < 2 GB (stream-shard: no full-model load) |
-| Integrity check | `verify_shards()` → ✅ all 50 files present, ZIP magic valid |
-
-### Run results (M5, 16 GB, SWLP W=2, greedy, 32 new tokens)
-
-Prompt: `"Explain in one sentence what makes a Macbook Air good for development."`
-
-Completion:
-> "The MacBook Air's combination of portability, long battery life, and powerful
-> performance makes it an excellent choice for developers who need to work
-> efficiently on the go."
-
-| Metric | Value |
-|---|---|
-| **Throughput** | **0.194 tok/s** |
-| **TTFT** | **24.8 ms** |
-| Generate time (32 tok) | 165.3 s |
-| RAM peak | **1.66 GB** (on a 16 GB machine) |
-| Load time | 5.1 s |
-| Config | `configs/swlp_qwen_mps.toml` |
-
-### Model-ladder summary (M5, 16 GB, SWLP W=2, FP16)
-
-| Model | Params | Layers | Layer size | Total | tok/s | TTFT | RAM peak | Fits? |
-|---|---|---|---|---|---|---|---|---|
-| Mistral-7B | ~7B | 32 | 436 MB | 13.96 GB | 0.422 | 13.6 ms | 1.13 GB | ✅ SWLP |
-| Qwen2.5-14B | ~14B | 48 | 551 MB | 26.4 GB | **0.194** | **24.8 ms** | **1.66 GB** | ✅ SWLP |
-| (20B rung) | ~20B | — | — | ~40 GB | — | — | — | deferred |
-| (30B rung) | ~30B | — | — | ~60 GB | — | — | — | deferred |
-
-**Key finding.** The 14B FP16 model (26.4 GB) fits on a 16 GB M5 with only
-1.66 GB RAM peak — SWLP's sliding window keeps just 2 layers resident at a time.
-Naive full-model load would require > 26 GB RAM and hard-OOM on this machine.
-
-**Throughput scales as expected with model size:**
-- 7B → 14B: 0.422 → 0.194 tok/s (0.46× ratio)
-- Theoretical from layer count + size: `(32 × 436) / (48 × 551) = 0.53×`
-- Measured ratio 0.46× is slightly below theoretical due to increased per-layer
-  compute cost at 14B hidden dim (5120 vs 4096).
-
-**RAM stays flat** — the W=2 window uses `2 × layer_size` regardless of model
-depth. 14B: 1.66 GB vs 7B: 1.13 GB — the difference is the larger layer size
-(550 MB vs 436 MB) plus the larger embed/lm_head tensors.
-
----
-
-## Phase 7 — FP8 weight storage: a measured negative result
-
-**Hypothesis:** storing layer shards as FP8 (half the bytes) would halve disk
-traffic and let the model fit the residency budget — projected 5–15 tok/s.
-
-**A+B spike:** built the FP8 shard format (`model/quant.py`, per-output-channel
-scaled `float8_e4m3`, FP16 compute), re-quantized the existing shards, measured.
-
-| Run | tok/s | TTFT | RAM peak | vs FP16 baseline |
-|---|---|---|---|---|
-| Mistral-7B FP16 (Phase 4) | 0.505 | 13.6 ms | 1.47 GB | — |
-| **Mistral-7B FP8** (residency engaged, 32/32 layers cached) | **0.436** | 5.6 ms | 7.34 GB | **0.86× — slower** |
-| Qwen2.5-14B FP16 (Phase 6) | 0.194 | 24.8 ms | 1.66 GB | — |
-| **Qwen2.5-14B FP8** (streaming, 0 resident) | **0.102** | 12.8 ms | 3.60 GB | **0.53× — ~2× slower** |
-
-FP8 layer sizes: Mistral 218 MB (was 436), Qwen 275 MB (was 551) — disk bytes
-genuinely halved. **Throughput still got worse.**
-
-**Quality (the one part of the thesis that held):** the FP8-7B completion is
-*byte-identical* to the FP16 completion — "A MacBook Air is an excellent choice
-for development due to its powerful processor, large storage capacity, long
-battery life, lightweight design, and compatibility". Per-channel-scaled FP8
-weight quantization is near-lossless, exactly as the literature predicts.
-
-**Root cause — the bottleneck was never disk bandwidth alone.** SWLP
-re-materializes every layer onto the device on *every token*
-(`to_empty` → transfer → `load_state_dict` → compute → `evict`). FP8 keeps
-compute in FP16, so each layer is dequantized FP8→FP16 on the CPU every token.
-That CPU dequant costs as much as the disk read it replaces — so halving disk
-bytes bought nothing, and the dequant overhead made it net slower. This
-re-confirms the Phase 4 finding (removing the disk read via residency did not
-help) from the precision angle.
-
-**Consequence:** the "store weights smaller, dequant in the streaming window"
-strategy is a dead end under the current per-token-materialization architecture
-— INT4 would fail worse still. The measured path to interactive speed is
-*native quantized compute* (MLX 4-bit hit ~30 tok/s in the Phase 3 table) or
-speculative decoding (Phase 5), not weight-streaming precision tricks. SWLP's
-proven, defensible niche remains **lossless FP16 feasibility of models that do
-not fit RAM** — not raw throughput.
-
----
-
-## Phase 8 — MLX interactive backend: the throughput breakthrough
-
-Phase 7 proved weight-streaming precision tricks cannot beat the disk wall on M5.
-Phase 8 takes the measured lesson — "store smaller" only helps if it becomes
-"compute faster", and on Apple Silicon only **MLX** has native quantized matmul —
-and adds an `MlxRunner`, interchangeable via `build_runner()` (`backend="mlx"`).
-
-All runs on M5 (Apple Silicon, 16 GB), greedy, 32 new tokens, same prompt.
-
-| Model | Backend | tok/s | TTFT | vs SWLP FP16 | Completion vs FP16 |
-|---|---|---|---|---|---|
-| Mistral-7B | SWLP FP16 streaming | 0.50 | 13.6 ms | 1× | reference |
-| **Mistral-7B** | **MLX int8** | **16.0** | 1.09 s | **32× faster** | **byte-identical (lossless)** |
-| Mistral-7B | MLX int4 | 27.9 | 2.96 s | 56× faster | minor wording drift |
-| Qwen2.5-14B | SWLP FP16 streaming | 0.19 | 24.8 ms | 1× | reference |
-| Qwen2.5-14B | MLX int8 | — | — | — | **OOM** — 14 GB model > 16 GB |
-| **Qwen2.5-14B** | **MLX int4** | **13.8** | (see note) | **71× faster** | minor wording drift |
-
-**Key results.**
-
-- **The interactive-speed goal is met.** MLX int8 on Mistral-7B runs at **16 tok/s
-  and its completion is byte-identical to the FP16 baseline** — int8 weight
-  quantization is genuinely lossless here. This is the near-lossless default
-  tier: top-notch quality *and* interactive speed.
-- **The quality dial is real.** int4 trades a small, visible wording drift for
-  ~1.7× more speed (Mistral-7B 28 tok/s). int8 = lossless default; int4 = fast
-  tier, clearly labelled — the honest two-tier strategy.
-- **Quant doubles as a memory dial.** 14B int8 (~14 GB) OOMs on the 16 GB M5;
-  14B int4 (~7 GB) fits and runs at 13.8 tok/s. On 16 GB, int4 is the 14B path.
-- The 14B int4 TTFT is inflated by first-run kernel compilation; steady-state
-  throughput (MLX's own `generation_tps`) is the reliable figure.
-- `ram_peak_bytes` for MLX is measured via psutil RSS, which under-reports
-  MLX's memory-mapped / wired GPU memory — treat MLX RAM figures as a floor.
-
-**Positioning.** SWLP's streaming runners remain the **lossless FP16
-big-model-feasibility** tool (run a 26 GB model in 1.7 GB RAM). `MlxRunner` is
-the **interactive-speed** tool. Two runners, one factory — the user picks the
-point on the quality/speed/feasibility surface that fits the job.
-
----
-
-## Phase 10 — Batched streaming (column-wise execution)
-
-SWLP streams every layer from disk once per decode step. The disk read costs the
-same whether 1 or N sequences pass through that layer, so processing a **batch**
-in lockstep amortizes the read across all N — FlexGen's "column-wise execution".
-
-**Measured (M5, SmolLM2-360M FP16 shards, window=2, decode-sweep wall time):**
-
-| Batch | Sweep time | Aggregate throughput |
-|------:|-----------:|---------------------:|
-|     1 |    0.282 s |        3.54 tok/s    |
-|     2 |    0.326 s |        6.13 tok/s    |
-|     4 |    0.264 s |       15.13 tok/s    |
-|     8 |    0.337 s |       23.73 tok/s    |
-|    16 |    0.243 s |       65.75 tok/s    |
-
-**Key result.** Decode-sweep wall time is essentially **flat** (~0.24–0.34 s)
-across batch 1→16 — the per-sweep disk cost is batch-independent. Aggregate
-throughput therefore scales ~linearly: **batch 16 is ~18.5× the batch-1 rate**,
-fully lossless FP16.
-
-**Lossless confirmed.** Each sequence in a batch produces output **bit-identical**
-to a batch-1 run (greedy decode is row-independent): batched row 0 and `run()`
-both emit `"Paris.\n\nParis is the capital"` on the same prompt. Left-padded
-sequences in the same batch are also correct.
-
-**Bug fixed en route.** Batched streaming initially produced garbage — root
-cause: `DynamicCache(config=…)` pre-structures the per-layer cache for the
-config layout and silently corrupts batched (N>1) K/V writes. Batch-1 always
-worked, so it was latent through Phases 1–8. `LlamaLikeAdapter.init_past_state`
-now uses plain `DynamicCache()`, which grows dynamically and handles any batch.
-
-> Numbers are on SmolLM2-360M (small layers — absolute rates are modest); the
-> headline 7B/14B batched measurement is pending re-download of the Mistral /
-> Qwen shards. The *scaling* (flat sweep time → linear aggregate throughput) is
-> architecture-independent and the conclusion the paper rests on.
-
----
-
-## Pending — NVIDIA column (MX230)
-
-To be measured on Pop!_OS + MX230 (2 GB VRAM) and added as a second hardware
-column: SWLP RAM→VRAM async-PCIe streaming vs the same baselines.
-
----
-
-## Phase 20 — Hot-path copy elimination (measured improvement)
-
-**Diagnosis.** The Phase 19 warm-cache median (~0.21 tok/s) sat at only 44% of
-the cold-SSD ceiling (0.496 tok/s) even though warm reads are far faster than
-the SSD — proof the bottleneck was CPU-side overhead, not disk. Per layer per
-token the old path performed three full-shard copies on the compute thread
-(chunk-list join → safetensors deserialize → host→device cast) plus a wasted
-`to_empty(device)` allocation that `assign=True` immediately replaced.
-
-**Fix (`core/shard_io.py` + `core/streaming.py` rewrite):** shards are read
-once via `readinto()` into a reusable per-worker buffer, tensors are zero-copy
-views into that buffer, and the single host→device copy runs on a persistent
-worker pool — `ensure()` on the compute thread is reduced to a
-pointer-assigning `load_state_dict(assign=True)`.
-
-**Measured (M5 16 GB, same prompt/harness, direct I/O = F_NOCACHE on, W=2,
-greedy; 2026-06-11):**
-
-| Model | Metric | Before | After | Change |
-|---|---|---|---|---|
-| Mistral-7B FP16 (8 tok) | tok/s | 0.218 | **0.372** (median of 3: 0.360/0.372/0.379) | **+71%** (75% of the 0.496 cold ceiling, up from 44%) |
-| Mistral-7B FP16 | prefill | 5.86 s | **2.30 s** | 2.5× faster |
-| Mistral-7B FP16 | RAM peak | 1.18 GB | 1.17 GB | flat |
-| Qwen2.5-0.5B FP16 (16 tok) | tok/s | 5.47 | **8.39** | +53% |
-| Qwen2.5-0.5B FP16 | TTFT | 1.38 s | 0.44 s | 3.1× faster |
-
-Completions are **byte-identical** before/after on both models — the change is
-pure I/O-path engineering, zero quality impact.
-
-**Direct-I/O policy (`SWLP_DIRECT_IO=auto|on|off`).** F_NOCACHE is no longer
-hardwired: `auto` bypasses the page cache only when the model exceeds ~60% of
-available RAM (cyclic access through a too-small LRU cache gets ~0 hits and
-only evicts useful pages). Models that fit get page-cache residency for free —
-unlike Phase 4 heap residency it is reclaimable under pressure, so it cannot
-trigger the memory-compressor collapse. Qwen2.5-0.5B with `auto` (cached):
-**9.85 tok/s, TTFT 0.195 s**. Benchmark harnesses pin `swlp_direct_io="on"`
-so controlled runs can never be silently warmed.
-
-Numbers above are single runs (n=1) recorded during development; the
-paper-grade re-measurement (≥5 runs, median ± IQR via
-`bench_common.summarize_runs`, `--cold` purge) is queued in ROADMAP open work.
-
-## Phase 21 — Draft-model speculative decoding (lossless, acceptance-bound)
-
-A resident Qwen2.5-0.5B-Instruct (~1 GB FP16) drafts up to 8 tokens per step;
-the streamed Qwen2.5-14B target verifies them all in **one** 48-layer disk
-sweep. Unlike the Phase 5 n-gram drafter (~0% acceptance on novel text), the
-draft model proposes on every step. Draft length adapts to acceptance (AIMD:
-double on full accept, halve on poor accept, floor 1), which caps the
-worst-case drafting overhead on low-agreement text.
-
-**Measured (M5 16 GB, Qwen2.5-14B-Instruct FP16 streamed from `shards/qwen-14b`
-~28 GB, W=2, direct I/O on, greedy, 32 new tokens; single runs 2026-06-11):**
-
-| Workload | Baseline swlp | Draft-spec | Speedup | Acceptance | tokens/sweep |
-|---|---|---|---|---|---|
-| Open-ended sentence | 0.187 tok/s | **0.545 tok/s** | **2.9×** | 47.7% | 3.2 |
-| Constrained list | 0.197 tok/s | **1.158 tok/s** | **5.9×** | 90.0% | 8.0 |
-
-Completions are **byte-identical** to plain greedy SWLP on both prompts —
-every drafted token is greedily verified by the target; speculation changes
-throughput only. The first interactive-class number (>1 tok/s) on a 28 GB FP16
-model from a 16 GB machine, with zero quality compromise.
-
-Two negative results worth recording:
-
-- **Fixed draft length regresses.** K=8 without adaptation scored 0.151 tok/s
-  on the open-ended prompt (−19% vs baseline) — greedy 0.5B/14B chains diverge
-  at the first token of a free continuation, and every sweep then pays 8
-  wasted drafter forwards. Adaptive K turned the same workload into 2.9×.
-- **A 3× larger drafter bought nothing.** Qwen2.5-1.5B matched the 0.5B's
-  acceptance exactly (5/34 on the hard prompt) at triple the residency;
-  disagreement on open-ended text is about the target's specific phrasing,
-  not drafter capacity. 0.5B remains the default
-  (`configs/swlp_qwen_draft_mps.toml`).
-
-The speedup is acceptance-bound and acceptance is workload-bound: quote the
-2.9×–5.9× range, not a point estimate. Mistral-7B has no same-tokenizer small
-draft model, so draft-spec currently applies to the Qwen column only.
+Phase 4, Mistral-7B FP16, 16 GB. The comparison baseline was a warm run.
+
+| Configuration | tok/s | RAM peak |
+|---|---:|---:|
+| All streaming (reference, warm) | 0.502 | 1.13 GB |
+| 17 layers resident on MPS | 0.041 | about 9 GB. The Metal allocator fragmented. |
+| 17 layers resident in CPU RAM | 0.080 | about 9 GB. The macOS memory compressor fired. |
+| `auto` with the full-model-fit guard (0 resident) | 0.505 | 1.47 GB |
+
+Locking 7.4 GB of resident layers pushes the page cache out for the 6.5 GB of streamed shards.
+`plan_residency()` therefore turns residency on only when the whole model fits in
+`(RAM − 6 GB) × 0.75`. For 7B FP16 that needs at least 32 GB of RAM. Models that fit get
+reclaimable page-cache residency instead, through `SWLP_DIRECT_IO=auto` (Phase 20). For
+example, Qwen2.5-0.5B reached 9.85 tok/s with a 0.195 s TTFT.
+
+## Speculative decoding
+
+### Prompt-lookup n-gram drafter (Phase 5, Mistral-7B)
+
+The baseline was the warm 0.505 run.
+
+| Workload | Drafts accepted / proposed | Tokens per sweep | tok/s | vs baseline |
+|---|---|---:|---:|---:|
+| Novel text | 0 / 0 | 1.03 | 0.471 | 0.93× |
+| Mildly repetitive | 6 / 6 | 1.28 | 0.578 | 1.15× |
+| Repetition-heavy (48 tokens) | 35 / 35 | 4.00 | 1.66 | 3.29× |
+
+When a draft fires, all of it is accepted. The speed-up depends on how often the output repeats
+earlier context. No extra RAM is used.
+
+### Draft model (Phase 21, Qwen2.5-14B, Qwen2.5-0.5B drafter)
+
+Direct I/O, W=2, 32 tokens.
+
+| Workload | Baseline | Draft-spec | Speed-up | Acceptance | Tokens per sweep |
+|---|---:|---:|---:|---:|---:|
+| Open-ended sentence | 0.187 | **0.545** | 2.9× | 47.7% | 3.2 |
+| Constrained list | 0.197 | **1.158** | 5.9× | 90.0% | 8.0 |
+
+Output is byte-identical to plain greedy streaming. Two things did not help:
+
+- A fixed K=8 without adaptation gave 0.151 tok/s, which is 19% slower than the baseline.
+- A 1.5B drafter got the same acceptance as the 0.5B drafter at three times the memory.
+
+Mistral-7B has no small draft model with the same tokenizer.
+
+### Native MTP head (Phase 29, Qwen3.8-27B, fp16 shards, 64 layers)
+
+| Run | tok/s |
+|---|---:|
+| Baseline defaults, before the fix (10 GB footprint, swapping) | 0.035 |
+| Window 1, prefetch 1, residency off | 0.100 |
+| Defaults with the embedding kept on CPU via mmap (8.4 GB peak) | 0.135 |
+| `--mtp`, max draft 2 / 4 / 16 | 0.339 / 0.461 / **0.498** |
+
+Output is identical to plain decoding. Splitting shard reads into 2 parallel `pread` calls made
+the pipeline 3× slower, even though it was faster in isolation.
+
+## Model ladder (FP16 streaming, W=2)
+
+| Model | Layers × size | Total | tok/s | TTFT | RAM peak |
+|---|---|---:|---:|---:|---:|
+| Mistral-7B | 32 × 436 MB | 13.96 GB | see [above](#mistral-7b-fp16-streaming) | | 0.8–1.2 GB |
+| Qwen2.5-14B (Phase 6) | 48 × 551 MB | 26.4 GB | 0.194 (before Phase 20) | 24.8 ms | 1.66 GB |
+| Mistral-Small-24B | 40 × ~850 MB | ~44 GB | 0.081 (warm) | 12.65 s | 3.76 GB |
+| Qwen3.8-27B (hybrid DeltaNet) | 64 layers | 48.7 GB | 0.135; 0.498 with MTP | | 8.4 GB |
+
+Peak RAM grows with layer size, not with the number of layers. None of these models can be
+fully loaded on this machine.
+
+## MLX backend (Phase 8)
+
+32 tokens, same prompt as the Phase 3 runs.
+
+| Model | Backend | tok/s | Completion vs FP16 |
+|---|---|---:|---|
+| Mistral-7B | `mlx --quant int8` | **16.0** | Byte-identical |
+| Mistral-7B | `mlx --quant int4` | 27.9 | Minor wording drift |
+| Qwen2.5-14B | `mlx --quant int8` | — | Out of memory (~14 GB) |
+| Qwen2.5-14B | `mlx --quant int4` | **13.8** | Minor wording drift |
+
+MLX RAM figures come from psutil RSS, which under-reports wired Metal memory.
+
+## MoE expert streaming
+
+### OLMoE-1B-7B BF16 (Phase 30; 64 experts, top-8)
+
+| Configuration | tok/s | Expert hit rate |
+|---|---:|---:|
+| torch `swlp` MoE path, 9 GB budget | 0.55 | — |
+| `mlx-moe`, 12% of experts cached | 8.8 | 37% |
+| `mlx-moe`, 49% cached | 10.4 | 78% |
+| `mlx-moe`, 70% cached | 19.9 | 93% |
+| `mlx-moe`, 70% cached: LFU vs LRU (same-session A/B) | 16.6 vs 11.7 | 93% |
+
+Predictive prefetch was slower at every budget: 6.5 vs 9.6 tok/s at 12% cached. LRU scores
+about 0% hits at small budgets because decode touches every layer's top-k once per token. Run to
+run variation is large (8.8 vs 6.2 tok/s for the same point an hour apart), so only compare
+numbers from the same session.
+
+### Qwen3.6-35B-A3B BF16 (Phase 30; 256 experts, top-8; 256 tokens)
+
+| Expert budget | tok/s steady | Hit rate |
+|---|---:|---:|
+| 2.5 GB (LFU) | 4.4 | 45% |
+| auto (3.3 GB) | 4.5 | 52% |
+| max (6.4 GB, clamped to Metal) | 4.7–5.0 | 67% |
+| max, predictive prefetch | 2.8 | 71% |
+
+About 5 tok/s is the BF16 ceiling on 16 GB. The routing sync costs about 120 ms per token, and
+roughly 1 GB of expert misses per token dominates the rest.
+
+### Gemma 4 26B A4B, 4-bit MLX checkpoint (Phase 31)
+
+| Configuration | tok/s | Hit rate |
+|---|---:|---:|
+| Stock mlx_lm, full load | Crash (Metal out of memory) | — |
+| `mlx-moe`, auto budget 6.5 GB, 256 tokens, steady | **14.5** (p50 58 ms) | 95.3% |
+| `mlx-moe` CLI, 128 tokens including cold start | 11.7 (TTFT 1.8 s) | 91.5% |
+| `mlx-moe`, 3 GB budget | 7.2 | 77.7% |
+
+## Batched streaming (Phase 10, SmolLM2-360M FP16, W=2)
+
+| Batch | Sweep time | Aggregate tok/s |
+|---:|---:|---:|
+| 1 | 0.282 s | 3.54 |
+| 4 | 0.264 s | 15.13 |
+| 16 | 0.243 s | 65.75 |
+
+Sweep time stays flat as the batch grows, so aggregate throughput scales about linearly: batch
+16 is 18.5× batch 1. Each row is bit-identical to a batch-1 run. The 7B and 14B batched runs are
+still pending.
+
+## Lossless shard codec (.swz)
+
+Phase 22, Mistral-7B FP16, W=4, direct I/O. Compressed size ratio 0.673 (13.96 → 9.40 GB).
+
+| Variant | tok/s | Per-layer worker stages |
+|---|---:|---|
+| Plain `.safetensors` | **0.390** | read 120 ms + host-to-device 39 ms |
+| `.swz`, one decompress at a time | 0.264 | decompress 59 ms |
+| `.swz`, one decompress at a time, prefetch depth 4 | 0.278 | |
+
+Compression costs throughput on fast SSDs. Standalone, the decoder runs at 15 GB/s, but it drops
+to about 7 GB/s under load while competing for unified-memory bandwidth. It only wins below
+about 3.5 GB/s of SSD read. The disk saving of about 31% applies either way.
+
+## FP8 shards (Phase 7): negative result, format removed
+
+| Run | tok/s | vs FP16 |
+|---|---:|---:|
+| Mistral-7B FP8 (fully resident) | 0.436 | 0.86× |
+| Qwen2.5-14B FP8 (streaming) | 0.102 | 0.53× |
+
+Halving the bytes on disk didn't help. Converting FP8 back to FP16 on the CPU for every token
+cost as much as the read it saved. The completions were byte-identical. The FP8 format has since
+been removed, and loading an FP8 manifest raises an error.
+
+## KV cache (Phase 2)
+
+On Mistral-7B, lossless zlib compression of the KV cache gives only about 1.10× (level 1:
+1.104× at 29.0 s; level 9: 1.108× at 37.0 s), because FP16 activations are high-entropy.
+Completions are identical and generation is about 3% slower. The zlib tier is useful for
+offloading cold layers to host RAM, not for its compression ratio. INT4 KV (`--kv-quant int4`)
+is about 4× smaller, but its perplexity cost has not been measured yet.
+
+## Simulation vs end to end
+
+`swlp simulate` and `scripts/research/simtools` model only the scheduling pipeline: read,
+deserialize, upload, compute and evict. They leave out attention, KV bookkeeping, Python,
+Metal dispatch and synchronization, so real tok/s comes in well below the simulated value. Use
+the simulators to compare scheduling strategies, not to predict absolute throughput.
+
+The `swlp suite` tooling is validated on tiny-gpt2 (`benchmarks/suite-20260520T044433Z.json`),
+because the suite's full-model HF baseline can't load Mistral-7B on 16 GB.
+
+## Pending measurements
+
+- Paper-grade re-measurement after Phase 20: at least 5 runs, median and IQR, cold and warm,
+  SWLP and AirLLM in the same harness, plus a set of prompts for draft-model speculation.
+- AirLLM cold, and oLLM on the M5.
+- Batched runs on 7B and 14B. Qwen2.5-32B at W=2. Long context at 4K and 8K.
+- Cold-read latency of safetensors vs `.pt` shards. Perplexity cost of INT4 KV.
+- Qwen3-30B-A3B MoE sweep and DeepSeek-V4-Flash feasibility (Phase 28 targets). Qwen3.8-27B
+  re-sharded as bf16.

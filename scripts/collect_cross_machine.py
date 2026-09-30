@@ -20,22 +20,25 @@ Usage:
 Output:
     experiments/cross_machine/{hardware_id}/{model}_{timestamp}.json
 """
+
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 import time
 from pathlib import Path
 
-import sys
-import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 def get_hardware_id() -> dict:
     """Detect hardware and return a machine-readable profile."""
     try:
         from swlp.hardware.detect import detect_hardware
+
         hw = detect_hardware()
         return {
             "chip_name": hw.chip_name,
@@ -72,19 +75,21 @@ def measure_pipeline_ratio(model_alias: str, hw: dict) -> dict:
 def run_sweep(model_alias: str, hw: dict, full: bool = False) -> list[dict]:
     """Run resident count sweep and find best-observed configuration."""
     try:
-        from swlp.benchmark.event_simulator import (
-            EventSimulator, SimConfig, LayerTimings,
+        from scripts.research.simtools.event_simulator import (
+            EventSimulator,
+            LayerTimings,
+            SimConfig,
             SlidingWindowStrategy,
         )
-        from swlp.core.sweep import SweepConfig, run_sweep as run_sweep_core
 
         # Get model parameters
-        from swlp.cli_doctor import MODEL_LAYERS, KNOWN_FP16_GB
+        from swlp.cli_doctor import KNOWN_FP16_GB, MODEL_LAYERS
+
         if model_alias not in MODEL_LAYERS:
             return [{"error": f"unknown model: {model_alias}"}]
 
         num_layers, layer_size_mb = MODEL_LAYERS[model_alias]
-        total_gb = KNOWN_FP16_GB.get(model_alias, 0)
+        KNOWN_FP16_GB.get(model_alias, 0)
 
         # Estimate timings from hardware
         bandwidth_mb_per_s = hw.get("ssd_bandwidth_gbps", 3.0) * 1024 / 8
@@ -118,13 +123,15 @@ def run_sweep(model_alias: str, hw: dict, full: bool = False) -> list[dict]:
             sim = EventSimulator(config, timings, strategy)
             result = sim.simulate(num_tokens=10)
 
-            results.append({
-                "resident_count": resident_count,
-                "throughput_tok_per_sec": result.throughput_toks_per_sec,
-                "gpu_busy_pct": result.gpu_busy_pct * 100,
-                "gpu_idle_pct": (1 - result.gpu_busy_pct) * 100,
-                "gb_per_token": result.gb_per_token,
-            })
+            results.append(
+                {
+                    "resident_count": resident_count,
+                    "throughput_tok_per_sec": result.throughput_toks_per_sec,
+                    "gpu_busy_pct": result.gpu_busy_pct * 100,
+                    "gpu_idle_pct": (1 - result.gpu_busy_pct) * 100,
+                    "gb_per_token": result.gb_per_token,
+                }
+            )
 
         # Find best
         best = max(results, key=lambda r: r["throughput_tok_per_sec"])
@@ -142,8 +149,9 @@ def main():
     parser = argparse.ArgumentParser(description="Collect cross-machine SWLP data")
     parser.add_argument("--model", default=None, help="Specific model to test")
     parser.add_argument("--full", action="store_true", help="Full sweep (all resident counts)")
-    parser.add_argument("--output-dir", default="experiments/cross_machine",
-                       help="Output directory")
+    parser.add_argument(
+        "--output-dir", default="experiments/cross_machine", help="Output directory"
+    )
     args = parser.parse_args()
 
     # Detect hardware
@@ -174,8 +182,10 @@ def main():
         # Run sweep
         sweep = run_sweep(model, hw, full=args.full)
         if isinstance(sweep, dict) and "error" not in sweep:
-            print(f"    Best resident: R={sweep['best_resident']}, "
-                  f"{sweep['best_throughput']:.2f} tok/s")
+            print(
+                f"    Best resident: R={sweep['best_resident']}, "
+                f"{sweep['best_throughput']:.2f} tok/s"
+            )
         else:
             print(f"    Error: {sweep}")
 
